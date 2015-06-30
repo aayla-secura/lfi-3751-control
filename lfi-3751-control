@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+
+###############################################################################
+#
+# Copyright (C) 2015 Aleksandrina Nikolova <aayla.secura.1138@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+###############################################################################
+#
+# A control file for the LFI-3751 temperature controller
+# Requires seriald.py
+
+import os
+import random
+import regex
+import signal
+import socket
+import sys
+import time
+from seriald import SerialDaemon
+from serial import Serial, EIGHTBITS, PARITY_NONE, STOPBITS_ONE
+
+exec_name = os.path.basename(__file__)
+allowed_actions = ['start', 'stop', 'restart', 'reload', 'interact']
+
+pidfile = '/var/run/{}.pid'.format(exec_name)
+config_file = None
+host = 'localhost'		    # host to connect to
+port = 57002			    # port to request the daemon to listen on
+data_encoding = 'utf-8'		    # encoding of data transmitted over socket
+
+# required configuration of serial port
+serial_port = '/dev/ttyS0'
+baudrate = 19200
+bytesize = EIGHTBITS
+parity = PARITY_NONE
+stopbits = STOPBITS_ONE
+xonxoff = True
+
+unit_type = '1'	       # must be 1 - signifies temperature controller
+unit_address = 1       # default unit address unless specified for each command
+min_unit_address = 1
+max_unit_address = 2
+cmd_char = '!'	       # commands to the device must start with !
+cmd_length = 15	       # and must be 15 bytes long excluding FCS
+reply_length = 21      # device sends 21 bytes of data
+first_data_char = 10   # bytes 10 to 17 are the data field in the reply
+last_data_char = 17
+read_char = '1'	       # 1 for read commands, 2 for write commands
+write_char = '2'
+temp_lims = '-199.900 +199.900'	# temperature limits
+res_lims = '+000.000 +499.900'	# resistance limits
+cmds = {
+    'ACT_T': {
+	'code': '01',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {}
+    },
+    'ACT_R': {
+	'code': '02',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {}
+    },
+    'SET_T': {
+	'code': '03',
+        'read': {
+	    'format': '+DDD.DDD'
+        },
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': temp_lims
+	}
+    },
+    'SET_R': {
+	'code': '04',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': res_lims
+	}
+    },
+    'TE_I': {
+	'code': '05',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {}
+    },
+    'TE_V': {
+	'code': '06',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {}
+    },
+    'LIM_I_POS': {
+	'code': '07',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': '+000.000 +005.000'
+	}
+    },
+    'LIM_I_NEG': {
+	'code': '08',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': '-005.000 +000.000'
+	}
+    },
+    'AUX_T': {
+	'code': '09',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {}
+    },
+    'P': {
+	'code': '10',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': '+000.000 +100.000',
+            'alias': {
+                'AUTO_S': '-002.000',
+                'AUTO_D': '-001.000'
+            }
+	}
+    },
+    'I': {
+	'code': '11',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': '+000.400 +010.000',
+            'alias': {
+                'OFF': '+000.000'
+            }
+	}
+    },
+    'D': {
+	'code': '12',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': '+001.000 +100.000',
+            'alias': {
+                'OFF': '+000.000'
+            }
+	}
+    },
+    'A_T': {
+	'code': '21',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': temp_lims
+	}
+    },
+    'A_R': {
+	'code': '22',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': res_lims
+	}
+    },
+    'B_T': {
+	'code': '23',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': temp_lims
+	}
+    },
+    'B_R': {
+	'code': '24',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': res_lims
+	}
+    },
+    'C_T': {
+	'code': '25',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': temp_lims
+	}
+    },
+    'C_R': {
+	'code': '26',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': res_lims
+	}
+    },
+    'T_LIM_HIGH': {
+	'code': '31',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': temp_lims
+	}
+    },
+    'T_LIM_LOW': {
+	'code': '32',
+	'read': {
+	    'format': '+DDD.DDD'
+	},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'range': temp_lims
+	}
+    },
+    'OUTPUT': {
+	'code': '51',
+	'read': {
+	    'format': '+DDD.DDD',
+            'info': """Format is: +0<AE><AS>.<TL><IS><OS>:
+            AE: Autotune Error Codes:
+            	1: Zero value current limit error
+            	2: Current limit cannot reach SET T
+            	3: Non-uniform TE I step measured
+            	4: Rate sign change
+            AS: Autotune Status:
+            	0: Normal
+            	1: Autotune
+            TL: Temperature Limit or Error Limit Status:
+            	0: Normal
+            	1: Requires cleaning
+            IS: Integrator Status:
+            	0: OFF
+            	1: ON
+            OS: Output Status:
+            	0: OFF
+            	1: ON"""
+		},
+	'write': {
+	    'format': '+DDD.DDD',
+	    'alias': {
+                'ON': '+000.001',
+                'OFF': '+000.000'
+            }
+	}
+    },
+    'HALT': {
+	'code': '52',
+	'read': {
+	    'format': '+DDD.DDD',
+	},
+        'write': {}
+    },
+    'LOCAL': {
+	'code': '53',
+	'read': {
+	    'format': '+DDD.DDD',
+	},
+        'write': {}
+    }
+}
+
+###############################################################################
+################################ DAEMON RELATED ###############################
+###############################################################################
+
+def get_pid(pidfile_path):
+    if not os.path.exists(pidfile_path):
+        return None
+    
+    with open(pidfile_path, 'r') as pidfile:
+        return int(pidfile.readline().strip())
+    
+def start():
+    daemon = SerialDaemon(
+        name = exec_name,
+        config_file_path = config_file,
+        pidfile_path = pidfile,
+        socket_port = port,
+        data_encoding = data_encoding,
+        port = serial_port,
+        baudrate = baudrate,
+        bytesize = bytesize,
+        parity = parity,
+        stopbits = stopbits,
+        xonxoff = xonxoff
+    )
+    daemon.start()
+    
+def stop():
+    pid = get_pid(pidfile)
+    if pid is None:
+        return
+	
+    for addr in range(min_unit_address, max_unit_address + 1):
+        (status, cmd, val, addr) = process_input(['LOCAL',
+                                                  '',
+                                                  '{}'.format(addr)])
+        send_cmd(cmd, val, addr)
+        
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        print('Could not kill process {}'.format(pid), file = sys.stderr)
+    
+def load():
+    pid = get_pid(pidfile)
+    if pid is None:
+        return
+    
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except OSError:
+        print('Could not send SIGHUP to process {}'.format(pid),
+              file = sys.stderr)
+
+def interact():
+    prompt = """Enter "command value [address]".
+    Values are optional, their presence indicates a write command.
+    Address is optional, defaults to 1.
+    Enter to quit.
+    """
+
+    soc = connect_to_socket()
+    while True:
+        (status, cmd, val, addr) = process_input(input(prompt).split(' '))
+        if status == 0:
+            if cmd:
+                send_cmd(cmd, val, addr, soc)
+            else:
+                soc.close()
+                sys.exit(0)
+
+    soc.close()
+
+# must return 0 on success
+def send_cmd(cmd, val, addr, soc = None):
+    (status, cmd_str) = generate_cmd(cmd, val, addr)
+    if status == 0:
+        if soc is None:
+            # non-interactive mode
+            soc = connect_to_socket()
+            soc_close = True
+        else:
+            # interactive mode
+            soc_close = False
+            
+        # the device is to be halted (does not send a reply)
+        if regex.compile('HALT', regex.I).fullmatch(cmd):
+            # 1st byte is 0 => do not read reply from device
+            soc.sendall(bytes('0{}'.format(cmd_str), data_encoding))
+            time.sleep(1)	# give the daemon time to send the data
+            stop()
+            sys.exit(0)
+        else:
+            # read reply_length bytes from device
+            soc.sendall(bytes('2{length:0>2X}{cmd}'.format(
+                length = reply_length,
+                cmd = cmd_str), data_encoding))
+            
+            reply = soc.recv(1024).decode(data_encoding)
+            print('Device replied with: {}'.format(
+                reply[first_data_char - 1 : last_data_char]))
+            if 'info' in cmds[cmd]['read']:
+                print(cmds[cmd]['read']['info'])
+
+        if soc_close:
+            soc.close()
+
+    return status    
+
+def connect_to_socket():
+    soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    soc.connect((host, port))
+    return soc
+
+###############################################################################
+################################ SERIAL RELATED ###############################
+###############################################################################
+
+def generate_fcs(cmd):
+    fcs = 0
+    for char in cmd:
+        fcs = fcs^ord(char)
+    return fcs
+
+# must return 0 on success
+def generate_cmd(cmd, val, addr):
+    if val:
+        cmd_type = 'write'
+    else:
+        cmd_type = 'read'
+        
+    cmd_code = cmds[cmd]['code']
+    cmd_vals = cmds[cmd][cmd_type]
+    
+    # format must be defined if cmd_type is allowed for this command
+    if 'format' not in cmd_vals:
+        print('{type} is not a valid operation for command ' +
+              '{cmd}'.format(cmd = cmd, type = cmd_type),
+              file = sys.stderr)
+        return (1, None)
+
+    if cmd_type == 'write':
+        # it is a write command
+        
+        cmd_type = write_char
+        for alias in cmd_vals['alias'].keys() if 'alias' in cmd_vals else []:
+            # check if it is an alias
+            regex_pat = regex.compile(alias, regex.I)
+            if regex_pat.fullmatch(val):
+                val = cmd_vals['alias'][alias]
+                break
+        
+        else:
+            # else, first check if it is in the right format
+            val_format = cmd_vals['format']
+            
+            if val_format == '+DDD.DDD':
+                # value should be numeric
+                # accept any valid number and convert it to the right format
+                regex_pat = regex.compile('[+-]?[0-9]*(\.[0-9]*)?')
+                if regex_pat.fullmatch(val) is None:
+                    print('{val} is neither a known alias nor in the ' +
+                          'allowed format for command {cmd}'.format(
+                              cmd = cmd,
+                              val = val),
+                          file = sys.stderr)
+                    return (1, None)
+                    
+                val = '{sign}{val:0>7.3f}'.format(
+                    sign = ('+' if val[0].isdigit() or \
+                            val[0] == '.' else val[0]),
+                    val = abs(float(val)))
+            else:
+                val_format = val_format.replace('+', '\+')
+                val_format = val_format.replace('D', '[0-9]')
+                val_format = val_format.replace('A', '[a-zA-Z0-9_-]')
+                regex_pat = regex.compile(val_format, regex.I)
+                
+                if regex_pat.fullmatch(val) is None:
+                    print('{val} is neither a known alias nor in the ' +
+                          'allowed format for command {cmd}'.format(
+                              cmd = cmd,
+                              val = val),
+                          file = sys.stderr)
+                    return (1, None)
+        
+            # then check if it is in the allowed range
+            if 'range' in cmd_vals:
+                low_limit = float(cmd_vals['range'].split(' ')[0])
+                high_limit = float(cmd_vals['range'].split(' ')[1])
+                
+                if not low_limit <= float(val) <= high_limit:
+                    print('{val} is not within the allowed numerical range ' +
+                          'for command {cmd}'.format(cmd = cmd, val = val),
+                          file = sys.stderr)
+                    return (1, None)
+
+    else:
+        # it is a read command
+        
+        cmd_type = read_char
+        val = cmd_vals['format'].replace('D', '0').replace('A', '0')
+
+    # command to the device must be in the following format
+    cmd = '{}{}{}{}{}{}'.format(
+        cmd_char,
+        unit_type,
+        addr,
+        cmd_type,
+        cmd_code,
+        val
+    )
+    # append the FCS
+    cmd = '{cmd}{fcs:0>2X}'.format(cmd = cmd, fcs = generate_fcs(cmd))
+    return (0, cmd)
+
+def process_input(user_input):
+    cmd = user_input[0]
+
+    if len(user_input) > 1:
+        val = user_input[1]
+    else:
+        val = ''
+        
+    if len(user_input) > 2:
+        try:
+            addr = int(user_input[2])
+        except:
+            print('Unit address must be numeric! Aborting', file = sys.stderr)
+            return (1, None, None, None)
+        
+        if not min_unit_address <= addr <= max_unit_address:
+            print('Unit address must be between {min} and {max}! ' +
+                  'Aborting.'.format(min = min_unit_address,
+                                     max = max_unit_address),
+                  file = sys.stderr)
+            return (1, None, None, None)
+        addr = '{!s:0>2}'.format(int(user_input[2]))
+        
+    else:
+        addr = '{!s:0>2}'.format(unit_address)
+
+    return (0, cmd, val, addr)                                 
+
+###############################################################################
+##################################### MISC ####################################
+###############################################################################
+
+def usage():
+    print('Usage:\n{}'.format(exec_name), end = ' ', file = sys.stderr)
+    print(*allowed_actions, sep = '|', file = sys.stderr)
+    print('{} <command> [<value>] [<address>]'.format(exec_name),
+          file = sys.stderr)
+    print()
+    print('Available commands (case-insensitive):', file = sys.stderr)
+    print(*sorted(cmds.keys()), sep = ', ', file = sys.stderr)
+    sys.exit(2)
+    
+###############################################################################
+##################################### MAIN ####################################
+###############################################################################
+
+if os.geteuid() != 0:
+    print('Error: Must run as root', file = sys.stderr)
+    sys.exit(1)
+
+# must specify either daemon action or command [value [address]]
+if not 2 <= len(sys.argv) <= 4:
+    usage()
+    
+action = sys.argv[1]
+
+if not ( action in allowed_actions and len(sys.argv) == 2 ) and \
+   not action.upper() in cmds.keys():
+    usage()
+
+if action == 'start':
+    start()
+elif action == 'stop':
+    stop()
+elif action == 'restart':
+    stop()
+    time.sleep(1)	# wait for pidfile lock
+    start()
+elif action == 'reload':
+    load()
+elif action == 'interact':
+    interact()
+else:
+    args = [ action.upper() ]
+    args.extend(sys.argv[2:])
+    (status, cmd, val, addr) = process_input(args)
+    if status == 0:
+        sys.exit(send_cmd(cmd, val, addr))
+    else:
+        sys.exit(status)
