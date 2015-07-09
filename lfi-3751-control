@@ -29,6 +29,7 @@ import signal
 import socket
 import sys
 import time
+from optparse import OptionParser, make_option
 from seriald import SerialDaemon
 from serial import Serial, EIGHTBITS, PARITY_NONE, STOPBITS_ONE
 
@@ -38,7 +39,7 @@ allowed_actions = ['start', 'stop', 'restart', 'reload', 'interact']
 pidfile = '/var/run/{}.pid'.format(exec_name)
 config_file = None
 host = 'localhost'		    # host to connect to
-port = 57002			    # port to request the daemon to listen on
+port = 57001			    # port to request the daemon to listen on
 data_encoding = 'utf-8'		    # encoding of data transmitted over socket
 
 # required configuration of serial port
@@ -291,19 +292,37 @@ cmds = {
     },
     'HALT': {
 	'code': '52',
-	'read': {
+        'read': {},
+	'write': {
 	    'format': '+DDD.DDD',
-	},
-        'write': {}
+	}
     },
     'LOCAL': {
 	'code': '53',
-	'read': {
+        'read': {},
+	'write': {
 	    'format': '+DDD.DDD',
-	},
-        'write': {}
+	}
     }
 }
+
+usage_msg = ('\n%prog {actions}\n' + \
+    '%prog <command> [<value>] [--address=<address>]\n\n' + \
+    'Available commands (case-insensitive):\n{cmds}').format(
+    actions = '|'.join(allowed_actions),
+    cmds = ', '.join(cmds.keys()))
+opt_parser = OptionParser(
+    usage = usage_msg,
+    option_list = [
+        make_option('-a', '--address',
+                    type = 'int',
+                    dest = 'address',
+                    help = 'Address of unit: {min} to {max}'.format(
+                min = min_unit_address,
+                max = max_unit_address)
+                )
+        ]
+    )
 
 ###############################################################################
 ################################ DAEMON RELATED ###############################
@@ -337,11 +356,12 @@ def stop():
     if pid is None:
         return
 	
-    for addr in range(min_unit_address, max_unit_address + 1):
-        (status, cmd, val, addr) = process_input(['LOCAL',
-                                                  '',
-                                                  '{}'.format(addr)])
-        send_cmd(cmd, val, addr)
+    #for address in range(min_unit_address, max_unit_address + 1):
+    #    (status, cmd, val, addr) = \
+    #        process_input(['LOCAL',
+    #                       '--address={addr}'.format(addr = address)])
+    #    send_cmd(cmd, val, addr)
+    #    time.sleep(1)
         
     try:
         os.kill(pid, signal.SIGTERM)
@@ -389,28 +409,30 @@ def send_cmd(cmd, val, addr, soc = None):
         else:
             # interactive mode
             soc_close = False
-            
+
         # the device is to be halted (does not send a reply)
-        if regex.compile('HALT', regex.I).fullmatch(cmd):
+        if cmd == 'HALT':
             # 1st byte is 0 => do not read reply from device
             soc.sendall(bytes('0{}'.format(cmd_str), data_encoding))
-            time.sleep(1)	# give the daemon time to send the data
-            stop()
-            sys.exit(0)
         else:
             # read reply_length bytes from device
             soc.sendall(bytes('2{length:0>2X}{cmd}'.format(
-                length = reply_length,
-                cmd = cmd_str), data_encoding))
+                        length = reply_length,
+                        cmd = cmd_str), data_encoding))
             
             reply = soc.recv(1024).decode(data_encoding)
             print('Device replied with: {}'.format(
-                reply[first_data_char - 1 : last_data_char]))
+                    reply[first_data_char - 1 : last_data_char]))
             if 'info' in cmds[cmd]['read']:
                 print(cmds[cmd]['read']['info'])
 
         if soc_close:
             soc.close()
+
+        #if cmd == 'HALT' or cmd == 'LOCAL':
+        #    time.sleep(1)	# give the daemon time to send the data
+        #    stop()
+        #    sys.exit(0)
 
     return status    
 
@@ -441,8 +463,8 @@ def generate_cmd(cmd, val, addr):
     
     # format must be defined if cmd_type is allowed for this command
     if 'format' not in cmd_vals:
-        print('{type} is not a valid operation for command ' +
-              '{cmd}'.format(cmd = cmd, type = cmd_type),
+        print(('{type} is not a valid operation for command ' +
+               '{cmd}').format(cmd = cmd, type = cmd_type),
               file = sys.stderr)
         return (1, None)
 
@@ -452,8 +474,7 @@ def generate_cmd(cmd, val, addr):
         cmd_type = write_char
         for alias in cmd_vals['alias'].keys() if 'alias' in cmd_vals else []:
             # check if it is an alias
-            regex_pat = regex.compile(alias, regex.I)
-            if regex_pat.fullmatch(val):
+            if val == alias:
                 val = cmd_vals['alias'][alias]
                 break
         
@@ -466,10 +487,10 @@ def generate_cmd(cmd, val, addr):
                 # accept any valid number and convert it to the right format
                 regex_pat = regex.compile('[+-]?[0-9]*(\.[0-9]*)?')
                 if regex_pat.fullmatch(val) is None:
-                    print('{val} is neither a known alias nor in the ' +
-                          'allowed format for command {cmd}'.format(
-                              cmd = cmd,
-                              val = val),
+                    print(('{val} is neither a known alias nor in the ' +
+                           'allowed format for command {cmd}').format(
+                            cmd = cmd,
+                            val = val),
                           file = sys.stderr)
                     return (1, None)
                     
@@ -484,10 +505,10 @@ def generate_cmd(cmd, val, addr):
                 regex_pat = regex.compile(val_format, regex.I)
                 
                 if regex_pat.fullmatch(val) is None:
-                    print('{val} is neither a known alias nor in the ' +
-                          'allowed format for command {cmd}'.format(
-                              cmd = cmd,
-                              val = val),
+                    print(('{val} is neither a known alias nor in the ' +
+                           'allowed format for command {cmd}').format(
+                            cmd = cmd,
+                            val = val),
                           file = sys.stderr)
                     return (1, None)
         
@@ -497,8 +518,8 @@ def generate_cmd(cmd, val, addr):
                 high_limit = float(cmd_vals['range'].split(' ')[1])
                 
                 if not low_limit <= float(val) <= high_limit:
-                    print('{val} is not within the allowed numerical range ' +
-                          'for command {cmd}'.format(cmd = cmd, val = val),
+                    print(('{val} is not within the allowed numerical range ' +
+                           'for command {cmd}').format(cmd = cmd, val = val),
                           file = sys.stderr)
                     return (1, None)
 
@@ -522,30 +543,52 @@ def generate_cmd(cmd, val, addr):
     return (0, cmd)
 
 def process_input(user_input):
-    cmd = user_input[0]
+    (opts, args) = opt_parser.parse_args(user_input)
+    
+    addr = opts.address
+    if addr is None:
+        addr = unit_address
+    if not min_unit_address <= addr <= max_unit_address:
+        print(('Unit address must be between {min} and {max}! ' +
+               'Aborting.').format(min = min_unit_address,
+                                   max = max_unit_address),
+              file = sys.stderr)
+        return (1, None, None, None)
+    addr = '{!s:0>2}'.format(addr)
+        
+    cmd = args[0].upper()
 
-    if len(user_input) > 1:
-        val = user_input[1]
+    if cmd == 'HALT' or cmd == 'LOCAL':
+        # user does not provide value for this operation
+        # but operation is still 'write'
+        args.insert(1, '+000.000')
+        
+    if len(args) > 1:
+        val = args[1]
     else:
         val = ''
-        
-    if len(user_input) > 2:
-        try:
-            addr = int(user_input[2])
-        except:
-            print('Unit address must be numeric! Aborting', file = sys.stderr)
-            return (1, None, None, None)
-        
-        if not min_unit_address <= addr <= max_unit_address:
-            print('Unit address must be between {min} and {max}! ' +
-                  'Aborting.'.format(min = min_unit_address,
-                                     max = max_unit_address),
-                  file = sys.stderr)
-            return (1, None, None, None)
-        addr = '{!s:0>2}'.format(int(user_input[2]))
-        
-    else:
-        addr = '{!s:0>2}'.format(unit_address)
+
+    # if user specifies an address for a read command
+    #if val == 'r':
+    #    val = ''
+    #    
+    #if len(args) > 2:
+    #    try:
+    #        addr = int(args[2])
+    #    except ValueError:
+    #        print('Unit address must be numeric! Aborting', file = sys.stderr)
+    #        return (1, None, None, None)
+    #     
+    #    if not min_unit_address <= addr <= max_unit_address:
+    #        print(('Unit address must be between {min} and {max}! ' +
+    #               'Aborting.').format(min = min_unit_address,
+    #                                 max = max_unit_address),
+    #              file = sys.stderr)
+    #        return (1, None, None, None)
+    #    addr = '{!s:0>2}'.format(int(args[2]))
+    #     
+    #else:
+    #    addr = '{!s:0>2}'.format(unit_address)
 
     return (0, cmd, val, addr)                                 
 
@@ -554,13 +597,14 @@ def process_input(user_input):
 ###############################################################################
 
 def usage():
-    print('Usage:\n{}'.format(exec_name), end = ' ', file = sys.stderr)
-    print(*allowed_actions, sep = '|', file = sys.stderr)
-    print('{} <command> [<value>] [<address>]'.format(exec_name),
-          file = sys.stderr)
-    print()
-    print('Available commands (case-insensitive):', file = sys.stderr)
-    print(*sorted(cmds.keys()), sep = ', ', file = sys.stderr)
+    #print('Usage:\n{}'.format(exec_name), end = ' ', file = sys.stderr)
+    #print(*allowed_actions, sep = '|', file = sys.stderr)
+    #print('{} <command> [<value>] [<address>]'.format(exec_name),
+          #file = sys.stderr)
+    #print()
+    #print('Available commands (case-insensitive):', file = sys.stderr)
+    #print(*sorted(cmds.keys()), sep = ', ', file = sys.stderr)
+    process_input(['--help'])
     sys.exit(2)
     
 ###############################################################################
@@ -571,7 +615,7 @@ if os.geteuid() != 0:
     print('Error: Must run as root', file = sys.stderr)
     sys.exit(1)
 
-# must specify either daemon action or command [value [address]]
+# must specify either daemon action or command [value] [address]
 if not 2 <= len(sys.argv) <= 4:
     usage()
     
@@ -594,9 +638,7 @@ elif action == 'reload':
 elif action == 'interact':
     interact()
 else:
-    args = [ action.upper() ]
-    args.extend(sys.argv[2:])
-    (status, cmd, val, addr) = process_input(args)
+    (status, cmd, val, addr) = process_input(sys.argv[1:])
     if status == 0:
         sys.exit(send_cmd(cmd, val, addr))
     else:

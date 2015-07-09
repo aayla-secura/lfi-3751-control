@@ -33,6 +33,8 @@ import signal
 import socket
 import sys
 import syslog
+import traceback
+import tempfile
 from daemon import DaemonContext
 from serial import Serial
 
@@ -86,6 +88,11 @@ class SerialDaemon():
         Spaces around ``=`` are optional and have no effect.
         Option values may optionally be enclosed in either single or double
         quotes. # and any text following it on the line are ignored.
+
+    log_file
+        :Default: ``/tmp/<name>.log``
+
+        Log file used to log exceptions during daemon run.
 
     pidfile_path
         :Default: ``'/var/run/<name>.pid'``
@@ -147,6 +154,7 @@ class SerialDaemon():
             self,
             name = 'seriald',
             config_file = 0,
+            log_file = None,
             pidfile_path = 0,
             socket_port = 57001,
             socket_host = '',		# all available interfaces
@@ -161,6 +169,14 @@ class SerialDaemon():
         self.config_file = config_file
         if self.config_file == 0:
             self.config_file = '/etc/{name}.conf'.format(name = self.name)
+            
+        self.log_file = log_file
+        # log file will be used even if user specified None
+        if self.log_file is None:
+            self.log_file = os.path.join(
+                tempfile.gettempdir(), '{name}.log'.format(
+                    name = self.name))
+            
         self.pidfile_path = pidfile_path
         if self.pidfile_path == 0:
             self.pidfile_path = '/var/run/{name}.pid'.format(name = self.name)
@@ -194,33 +210,45 @@ class SerialDaemon():
                     setattr(self.serial_context, attr, kwargs.get(attr))
                     
     def _run(self):
-        
-        while True:
-            soc, soc_addr = self.socket.accept()
-            syslog.syslog(syslog.LOG_DAEMON, 'Connected to ' +
-                          '{addr}'.format(addr = soc_addr))
-            data = soc.recv(self.data_length).decode(self.data_encoding)
 
-            reply_length_byte_length = 0
+        with open(self.log_file, 'a') as log_file:
             try:
-                reply_length_byte_length = int(data[0], 16)
-                reply_length = int(data[1 : reply_length_byte_length + 1], 16)
-            except ValueError:
-                reply_length = 0
+                while True:
+                    soc, soc_addr = self.socket.accept()
+                    syslog.syslog(syslog.LOG_DAEMON, ('Connected to ' +
+                                                      '{addr}').format(
+                            addr = soc_addr))
+                    data = soc.recv(self.data_length).decode(
+                        self.data_encoding)
 
-            data = data[reply_length_byte_length + 1:]
-            syslog.syslog(syslog.LOG_DAEMON, 'Sending {data}'.format(
-                data = data))
-            self.serial_context.write(bytes(data, self.data_encoding))
-            self.serial_context.flush()
+                    reply_length_byte_length = 0
+                    try:
+                        reply_length_byte_length = int(data[0], 16)
+                        reply_length = int(
+                            data[1 : reply_length_byte_length + 1], 16)
+                    except ValueError:
+                        reply_length = 0
 
-            syslog.syslog(syslog.LOG_DAEMON, 'Will read {length} bytes'.format(
-                length = reply_length))
-            if reply_length > 0:
-                reply = self.serial_context.read(reply_length)
-                syslog.syslog(syslog.LOG_DAEMON, 'Received {data}'.format(
-                    data = reply.decode(self.data_encoding)))
-                soc.sendall(reply)
+                    data = data[reply_length_byte_length + 1:]
+
+                    syslog.syslog(syslog.LOG_DAEMON, 'Sending {data}'.format(
+                            data = data))
+                    self.serial_context.write(bytes(data, self.data_encoding))
+                    self.serial_context.flush()
+                    
+                    syslog.syslog(syslog.LOG_DAEMON, ('Will read {length} ' +
+                                                      'bytes').format(
+                            length = reply_length))
+                    if reply_length > 0:
+                        reply = self.serial_context.read(reply_length)
+                        syslog.syslog(syslog.LOG_DAEMON, ('Received ' +
+                                                          '{data}').format(
+                                data = reply.decode(self.data_encoding)))
+                        soc.sendall(reply)
+            except:
+                traceback.print_exc(file = log_file)
+                
+        self._stop()
                 
     def _load_config(self):
         if self.config_file is not None:
@@ -269,8 +297,8 @@ class SerialDaemon():
                                 syslog.syslog(syslog.LOG_ERR,
                                               ('{conf}: Invalid value for ' +
                                                '{option}').format(
-                                                   conf = self.config_file,
-                                                   option = opt))
+                                        conf = self.config_file,
+                                        option = opt))
                                 val = getattr(self, opt)
                                 
                         setattr(self, opt, val)
@@ -279,8 +307,8 @@ class SerialDaemon():
                         syslog.syslog(syslog.LOG_ERR,
                                       ('{conf}: Invalid syntax at line ' +
                                        '{line}').format(
-                                           conf = self.config_file,
-                                           line = line_num))
+                                conf = self.config_file,
+                                line = line_num))
                         
             syslog.syslog(syslog.LOG_DAEMON,
                           '{conf} loaded'.format(conf = self.config_file))
@@ -312,8 +340,9 @@ class SerialDaemon():
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind((self.socket_host, self.socket_port))
         self.socket.listen(1)
-        syslog.syslog(syslog.LOG_DAEMON, 'Listening on port ' +
-                      '{port}'.format(port = self.socket_port))
+        syslog.syslog(syslog.LOG_DAEMON, ('Listening on port ' +
+                                          '{port}').format(
+                port = self.socket_port))
         self._run()
         
     def _stop(self):
@@ -355,7 +384,8 @@ def _openfile(path, mode = 'r', fail = None):
                               path = path))
         elif repr(error).find('No such file') >= 0:
             syslog.syslog(syslog.LOG_ERR,
-                          'No such file or directory: {path}'.format(path = path))
+                          'No such file or directory: {path}'.format(
+                    path = path))
         else:
             syslog.syslog(syslog.LOG_ERR,
                           'Cannot {action} {path}. Unknown error.'.format(
