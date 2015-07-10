@@ -35,6 +35,7 @@ import sys
 import syslog
 import traceback
 import tempfile
+from time import sleep
 from daemon import DaemonContext
 from serial import Serial
 
@@ -228,17 +229,26 @@ class SerialDaemon():
                             data[1 : reply_length_byte_length + 1], 16)
                     except ValueError:
                         reply_length = 0
-
                     data = data[reply_length_byte_length + 1:]
 
+                    if not self.serial_context.isOpen():
+                        # first time in the loop
+                        syslog.syslog(syslog.LOG_DAEMON, 'Opening serial port')
+                        self.serial_context.open()
                     syslog.syslog(syslog.LOG_DAEMON, 'Sending {data}'.format(
                             data = data))
+                    # discard any input or output
+                    self.serial_context.flushOutput()
+                    self.serial_context.flushInput()
                     self.serial_context.write(bytes(data, self.data_encoding))
-                    self.serial_context.flush()
-                    
+                    # flush doesn't work in daemon mode
+                    # close and reopen instead
+                    self.serial_context.close()
+                    self.serial_context.open()
                     syslog.syslog(syslog.LOG_DAEMON, ('Will read {length} ' +
                                                       'bytes').format(
                             length = reply_length))
+                    
                     if reply_length > 0:
                         reply = self.serial_context.read(reply_length)
                         syslog.syslog(syslog.LOG_DAEMON, ('Received ' +
@@ -334,7 +344,9 @@ class SerialDaemon():
         with _openfile(self.daemon_context.pidfile.path, 'w',
                       fail = self._stop) as file:
             file.write('{pid}'.format(pid = os.getpid()))
-        self.serial_context.open()
+        # opening the serial port here doesn't work
+        # open it in _run instead
+        # self.serial_context.open()
         syslog.syslog(syslog.LOG_DAEMON, 'Started')
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -352,7 +364,8 @@ class SerialDaemon():
 
         syslog.syslog(syslog.LOG_DAEMON, 'Stopping')
         self.socket.close()
-        self.serial_context.close()
+        if self.serial_context.isOpen():
+            self.serial_context.close()
         self.daemon_context.close()
         os.remove(self.daemon_context.pidfile.path)
         
@@ -363,12 +376,12 @@ class SerialDaemon():
                           'Could not stop process id {pid}'.format(pid = pid))
         syslog.closelog()
         
-    def _accept_signal(self, signal, frame):
-        if signal == signal.SIGHUP:
+    def _accept_signal(self, sig, frame):
+        if sig == signal.SIGHUP:
             self._load_config()
         else:
             syslog.syslog(syslog.LOG_DAEMON,
-                          'Caught signal {sig}'.format(sig = signal))
+                          'Caught signal {sig}'.format(sig = sig))
             self._stop()
             
         
