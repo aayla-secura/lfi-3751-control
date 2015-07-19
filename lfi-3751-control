@@ -20,7 +20,7 @@
 ###############################################################################
 #
 # A control file for the LFI-3751 temperature controller
-# Requires seriald.py
+# Requires seriald, regex and matplotlib
 
 import os
 import random
@@ -29,8 +29,7 @@ import signal
 import socket
 import sys
 from matplotlib import animation, pyplot, ticker
-from random import uniform
-from time import time, sleep
+from time import time, sleep, strftime
 from optparse import OptionParser, make_option
 from seriald import SerialDaemon
 from serial import Serial, EIGHTBITS, PARITY_NONE, STOPBITS_ONE
@@ -51,7 +50,7 @@ def start(*args):
         name = exec_name,
         config_file_path = config_file,
         pidfile_path = pidfile,
-        socket_port = port,
+        socket_port = socket_port,
         data_encoding = data_encoding,
         port = serial_port,
         baudrate = baudrate,
@@ -59,7 +58,7 @@ def start(*args):
         parity = parity,
         stopbits = stopbits,
         xonxoff = xonxoff,
-        timeout = timeout
+        timeout = serial_timeout
     )
     daemon.start()
     
@@ -113,26 +112,35 @@ def interact(*args):
 # must return 0 on success
 def plot_realtime(user_input):
     # user_input[0] will be 'plot', discard it
-    status, cmd, val, addr, interval = process_input(user_input[1:])
-    if interval is None:
-        interval = 1
-        
+    status, cmd, val, addr, interval, \
+        log_file_path, log_dir = process_input(user_input[1:])
+    
     if status != 0:
         return status
-    
+
+    if log_file_path is None:
+        log_file_path = os.path.join(log_dir, '{name}_{date}.log'.format(
+            name = exec_name,
+            date = strftime('%Y-%m-%d_%H-%M-%S')))
+        
     def data_get():
         start_time = time()
         cur_time = 0
-        while True:
-            status, data = send_cmd(cmd, val, addr, verbose = False)
-            data = float(data)
-            if status != 0:
-                break
-            if cur_time == 0:
-                axes.set_ylim(data - 0.01, data + 0.01)
-            yield cur_time, data
-            cur_time = time() - start_time
-            sleep(interval)
+        
+        with open(log_file_path, 'a') as log_file:
+            while True:
+                status, data = send_cmd(cmd, val, addr, verbose = False)
+                log_file.write('{time}\t{data}\n'.format(
+                    time = cur_time,
+                    data = data))
+                data = float(data)
+                if status != 0:
+                    break
+                if cur_time == 0:
+                    axes.set_ylim(data - 0.01, data + 0.01)
+                yield cur_time, data
+                cur_time = time() - start_time
+                sleep(interval)
             
     def run(new_data):
         x, y = new_data
@@ -149,10 +157,8 @@ def plot_realtime(user_input):
             axes.set_ylim(y, ymax)
             
         curve.set_data(xdata, ydata)
-        # redrawing the canvas is glitchy => do it twice
         axes.figure.canvas.draw()
-        axes.figure.canvas.draw()
-        
+
         return curve,
 
     fig, axes = pyplot.subplots()
@@ -167,7 +173,7 @@ def plot_realtime(user_input):
     axes.grid()
     xdata, ydata = [], []
 
-    animation.FuncAnimation(
+    anim = animation.FuncAnimation(
         fig,
         run,
         frames = data_get,
@@ -184,7 +190,7 @@ def plot_realtime(user_input):
         hspace = 0
     )
     pyplot.show()
-
+    
     return 0
 
 # must return 0 on success
@@ -231,7 +237,9 @@ def send_cmd(cmd, val, addr, soc = None, verbose = True):
 
 def connect_to_socket():
     soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    soc.connect((host, port))
+    soc.connect((socket_host, socket_port))
+    soc.setblocking(0)
+    soc.settimeout(socket_timeout)
     return soc
 
 ###############################################################################
@@ -341,36 +349,46 @@ def generate_cmd(cmd, val, addr):
 
 def process_input(user_input):
     opts, args = opt_parser.parse_args(user_input)
-    
+
+    if len(args) == 0:
+        usage()
+
+    cmd = args[0].upper()
     address = opts.address
     interval = opts.interval
+    log_file = opts.log_file
+    log_dir = opts.log_dir
     
-    if address is None:
-        address = unit_address
+    if cmd == 'HALT' or cmd == 'LOCAL':
+        # user does not provide value for this operation
+        # but operation is still 'write'
+        args.insert(1, '+000.000')
+
+    if not 1 <= len(args) <= 2:
+        usage()
+
     if not min_unit_address <= address <= max_unit_address:
         print(('Unit address must be between {min} and {max}! ' +
                'Aborting.').format(min = min_unit_address,
                                    max = max_unit_address),
               file = sys.stderr)
-        return 1, None, None, None, None
+        return 1, None, None, None, None, None, None
     address = '{!s:0>2}'.format(address)
 
-    if interval is not None and interval < 0:
+    if interval < 0:
         print('Check interval cannot be negative!', file = sys.stderr)
-        return 1, None, None, None, None
-    cmd = args[0].upper()
+        return 1, None, None, None, None, None, None
 
-    if cmd == 'HALT' or cmd == 'LOCAL':
-        # user does not provide value for this operation
-        # but operation is still 'write'
-        args.insert(1, '+000.000')
-        
-    if len(args) > 1:
+    if log_dir != '':
+        if not os.path.isdir(log_dir):
+            os.mkdir(log_dir, mode = 0o755)
+            
+    if len(args) == 2:
         val = args[1]
     else:
         val = ''
 
-    return 0, cmd, val, address, interval
+    return 0, cmd, val, address, interval, log_file, log_dir
 
 def usage():
     process_input(['--help'])
@@ -408,12 +426,12 @@ allowed_actions = {
         'num_args': [ 0 ]
     },
     'plot': {
-        'usage': 'plot <command> [--address=<address>] [--interval=<interval>]',
+        'usage': 'plot <command> [--address] [--interval] [--log-file|--log-dir]',
         'callable': plot_realtime,
-        'num_args': range(1,4)
+        'num_args': range(1,5)
     },
     'single': {
-        'usage': '<command> [<value>] [--address=<address>]',
+        'usage': '<command> [<value>] [--address]',
         'callable': onetime_action,
         'num_args': range(0,3)
     }
@@ -421,9 +439,11 @@ allowed_actions = {
 
 pidfile = '/var/run/{name}.pid'.format(name = exec_name)
 config_file = None
-host = 'localhost'		    # host to connect to
-port = 57001			    # port to request the daemon to listen on
-data_encoding = 'utf-8'		    # encoding of data transmitted over socket
+socket_host = 'localhost'       # host to connect to
+socket_port = 57001             # port to request the daemon to listen on
+socket_timeout = 0.5            # timeout in seconds for socket.recv()
+data_encoding = 'utf-8'	        # encoding of data transmitted over socket
+default_plot_interval = 1       # seconds between data acquisition
 
 # required configuration of serial port
 serial_port = '/dev/ttyS0'
@@ -432,18 +452,18 @@ bytesize = EIGHTBITS
 parity = PARITY_NONE
 stopbits = STOPBITS_ONE
 xonxoff =  True
-timeout = 0.5
+serial_timeout = 0.5
 
-unit_type = '1'	       # must be 1 - signifies temperature controller
-unit_address = 1       # default unit address unless specified for each command
+unit_type = '1'	                # must be 1 - signifies temperature controller
+default_unit_address = 1        # default unit address
 min_unit_address = 1
 max_unit_address = 2
-cmd_char = '!'	       # commands to the device must start with !
-cmd_length = 15	       # and must be 15 bytes long excluding FCS
-reply_length = 21      # device sends 21 bytes of data
-first_data_char = 10   # bytes 10 to 17 are the data field in the reply
+cmd_char = '!'	                # commands to the device must start with !
+cmd_length = 15	                # and must be 15 bytes long excluding FCS
+reply_length = 21               # device sends 21 bytes of data
+first_data_char = 10            # bytes 10 to 17 are the data field in the reply
 last_data_char = 17
-read_char = '1'	       # 1 for read commands, 2 for write commands
+read_char = '1'	                # 1 for read commands, 2 for write commands
 write_char = '2'
 temp_lims = '-199.900 +199.900'	# temperature limits
 res_lims = '+000.000 +499.900'	# resistance limits
@@ -704,15 +724,39 @@ opt_parser = OptionParser(
                     type = 'int',
                     dest = 'address',
                     help = ('Address of unit: {min} to {max}. ' + \
-                            'Default is 1.').format(
-                        min = min_unit_address,
-                        max = max_unit_address)
+                            'Default is {default}.').format(
+                                min = min_unit_address,
+                                max = max_unit_address,
+                                default = default_unit_address),
+                    metavar = 'UNIT_ID',
+                    default = default_unit_address
                 ),
         make_option('-i', '--interval',
-                    type = 'int',
+                    type = 'float',
                     dest = 'interval',
-                    help = 'Only used for plotting: number of seconds ' + \
-                    'between data points. Default is 1.'
+                    help = ('Only used for plotting: number of seconds ' + \
+                            'between data points. ' + \
+                            'Default is {default}.').format(
+                                default = default_plot_interval),
+                    metavar = 'SECONDS',
+                    default = default_plot_interval
+                ),
+        make_option('-l', '--log-file',
+                    type = 'string',
+                    dest = 'log_file',
+                    help = ('Only used for plotting: path to log file. ' + \
+                            'Default is ./{name}_<date_time>.log').format(
+                                name = exec_name),
+                    metavar = 'FILE'
+                ),
+        make_option('-d', '--log-dir',
+                    type = 'string',
+                    dest = 'log_dir',
+                    help = 'Only used for plotting: base directory ' + \
+                    "for log files. Default is '.'. This option is " + \
+                    'ignored if --log-file is present.',
+                    metavar = 'DIR',
+                    default = ''
                 )
         ]
     )

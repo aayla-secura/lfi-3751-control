@@ -18,7 +18,7 @@
 ###############################################################################
 #
 # A wrapper class for Serial and DaemonContext,
-# Requires serial.py and daemon/daemon.py
+# Requires pyserial, python-daemon and regex
 
 """Serial port communication daemon with inet socket interface.
 
@@ -251,10 +251,12 @@ class SerialDaemon():
                     
                     if reply_length > 0:
                         reply = self.serial_context.read(reply_length)
-                        syslog.syslog(syslog.LOG_DAEMON, ('Received ' +
-                                                          '{data}').format(
-                                data = reply.decode(self.data_encoding)))
-                        soc.sendall(reply)
+                        reply_decoded = reply.decode(self.data_encoding)
+                        syslog.syslog(syslog.LOG_DAEMON,
+                                      'Received {data}'.format(
+                                          data = reply_decoded))
+                        if len(reply_decoded) == reply_length:
+                            soc.sendall(reply)
             except:
                 traceback.print_exc(file = log_file)
                 
