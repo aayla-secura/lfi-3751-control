@@ -97,14 +97,16 @@ def interact(*args):
     """
 
     soc = connect_to_socket()
-    while True:
-        status, cmd, val, addr = process_input(input(prompt).split(' '))[0:4]
-        if status == 0:
-            if cmd:
-                send_cmd(cmd, val, addr, soc)
-            else:
-                soc.close()
-                return 0
+    try:
+        while True:
+            status, cmd, val, addr = process_input(input(prompt).split(' '))[0:4]
+            if status == 0:
+                if cmd is not None:
+                    send_cmd(cmd, val, addr, soc)
+                else:
+                    break
+    except KeyboardInterrupt:
+        pass
 
     soc.close()
     return 0
@@ -122,6 +124,8 @@ def plot_realtime(user_input):
         log_file_path = os.path.join(log_dir, '{name}_{date}.log'.format(
             name = exec_name,
             date = strftime('%Y-%m-%d_%H-%M-%S')))
+
+    soc = connect_to_socket()
         
     def data_get():
         start_time = time()
@@ -129,18 +133,26 @@ def plot_realtime(user_input):
         
         with open(log_file_path, 'a') as log_file:
             while True:
-                status, data = send_cmd(cmd, val, addr, verbose = False)
-                log_file.write('{time}\t{data}\n'.format(
+                status, data = send_cmd(cmd, val, addr, soc, verbose = False)
+                sleep(interval)
+                
+                if status == 1:
+                    # argument processing did not succeed, abort
+                    break
+                if status == 2:
+                    # reading reply from device did not succeed, ignore
+                    continue
+
+                data = float(data)
+                log_file.write('{time!s}\t{data!s}\n'.format(
                     time = cur_time,
                     data = data))
-                data = float(data)
-                if status != 0:
-                    break
                 if cur_time == 0:
                     axes.set_ylim(data - 0.01, data + 0.01)
+                    
                 yield cur_time, data
                 cur_time = time() - start_time
-                sleep(interval)
+                
             
     def run(new_data):
         x, y = new_data
@@ -189,8 +201,12 @@ def plot_realtime(user_input):
         wspace = 0,
         hspace = 0
     )
-    pyplot.show()
-    
+    try:
+        pyplot.show()
+    except KeyboardInterrupt:
+        pass
+
+    soc.close()
     return 0
 
 # must return 0 on success
@@ -203,13 +219,14 @@ def onetime_action(user_input):
 # must return 0 on success
 def send_cmd(cmd, val, addr, soc = None, verbose = True):
     status, cmd_str = generate_cmd(cmd, val, addr)
+    data = None
     if status == 0:
         if soc is None:
-            # non-interactive mode
+            # one-time command mode
             soc = connect_to_socket()
             soc_close = True
         else:
-            # interactive mode
+            # continuous command mode
             soc_close = False
 
         # the device is to be halted (does not send a reply)
@@ -221,14 +238,17 @@ def send_cmd(cmd, val, addr, soc = None, verbose = True):
             soc.sendall(bytes('2{length:0>2X}{cmd}'.format(
                 length = reply_length,
                 cmd = cmd_str), data_encoding))
-            
-            reply = soc.recv(1024).decode(data_encoding)
-            data = reply[first_data_char - 1 : last_data_char]
-            if verbose:
-                print('Device replied with: {data}'.format(
-                    data = data))
-                if 'info' in cmds[cmd]['read']:
-                    print(cmds[cmd]['read']['info'])
+            try:
+                reply = soc.recv(1024).decode(data_encoding)
+            except socket.timeout:
+                status = 2
+            else:
+                data = reply[first_data_char - 1 : last_data_char]
+                if verbose:
+                    print('Device replied with: {data}'.format(
+                        data = data))
+                    if 'info' in cmds[cmd]['read']:
+                        print(cmds[cmd]['read']['info'])
                     
         if soc_close:
             soc.close()
@@ -237,7 +257,13 @@ def send_cmd(cmd, val, addr, soc = None, verbose = True):
 
 def connect_to_socket():
     soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    soc.connect((socket_host, socket_port))
+    try:
+        soc.connect((socket_host, socket_port))
+    except ConnectionRefusedError:
+        print('Connection refused. Did you forget to start the daemon?',
+              file = sys.stderr)
+        sys.exit(2)
+        
     soc.setblocking(0)
     soc.settimeout(socket_timeout)
     return soc
@@ -351,7 +377,7 @@ def process_input(user_input):
     opts, args = opt_parser.parse_args(user_input)
 
     if len(args) == 0:
-        usage()
+        return 0, None, None, None, None, None, None
 
     cmd = args[0].upper()
     address = opts.address
@@ -441,7 +467,7 @@ pidfile = '/var/run/{name}.pid'.format(name = exec_name)
 config_file = None
 socket_host = 'localhost'       # host to connect to
 socket_port = 57001             # port to request the daemon to listen on
-socket_timeout = 0.5            # timeout in seconds for socket.recv()
+socket_timeout = 1              # timeout in seconds for socket.recv()
 data_encoding = 'utf-8'	        # encoding of data transmitted over socket
 default_plot_interval = 1       # seconds between data acquisition
 

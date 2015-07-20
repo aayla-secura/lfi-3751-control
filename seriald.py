@@ -214,13 +214,31 @@ class SerialDaemon():
 
         with open(self.log_file, 'a') as log_file:
             try:
+                syslog.syslog(syslog.LOG_DAEMON, 'Waiting for connection')
+                soc, soc_addr = self.socket.accept()
+                syslog.syslog(syslog.LOG_DAEMON, ('Connected to ' +
+                                                  '{addr}').format(
+                                                      addr = soc_addr))
+
                 while True:
-                    soc, soc_addr = self.socket.accept()
-                    syslog.syslog(syslog.LOG_DAEMON, ('Connected to ' +
-                                                      '{addr}').format(
-                            addr = soc_addr))
+                    if soc.fileno() < 0:
+                        syslog.syslog(syslog.LOG_DAEMON,
+                                      'Waiting for connection')
+                        soc, soc_addr = self.socket.accept()
+                        syslog.syslog(syslog.LOG_DAEMON, ('Connected to ' +
+                                                          '{addr}').format(
+                                                              addr = soc_addr))
+
                     data = soc.recv(self.data_length).decode(
                         self.data_encoding)
+                    if data == '':
+                        syslog.syslog(syslog.LOG_DAEMON, 'Closing connection')
+                        soc.close()
+                        continue
+
+                    syslog.syslog(syslog.LOG_DAEMON,
+                                  'Read from socket: {data}'.format(
+                                      data = data))
 
                     reply_length_byte_length = 0
                     try:
@@ -256,7 +274,12 @@ class SerialDaemon():
                                       'Received {data}'.format(
                                           data = reply_decoded))
                         if len(reply_decoded) == reply_length:
-                            soc.sendall(reply)
+                            try:
+                                soc.sendall(reply)
+                            except ConnectionResetError:
+                                soc.close()
+                                continue
+
             except:
                 traceback.print_exc(file = log_file)
                 
