@@ -32,7 +32,10 @@ import regex
 import signal
 import socket
 import sys
-import syslog
+from syslog import openlog as opensyslog
+from syslog import closelog as closesyslog
+from syslog import syslog as logsyslog
+from syslog import LOG_INFO, LOG_DAEMON, LOG_ERR
 import traceback
 import tempfile
 from time import sleep
@@ -214,31 +217,27 @@ class SerialDaemon():
 
         with open(self.log_file, 'a') as log_file:
             try:
-                syslog.syslog(syslog.LOG_DAEMON, 'Waiting for connection')
+                logsyslog(LOG_INFO, 'Waiting for connection')
                 soc, soc_addr = self.socket.accept()
-                syslog.syslog(syslog.LOG_DAEMON, ('Connected to ' +
-                                                  '{addr}').format(
-                                                      addr = soc_addr))
-
+                logsyslog(LOG_INFO, 'Connected to {addr}'.format(
+                    addr = soc_addr))
+                
                 while True:
                     if soc.fileno() < 0:
-                        syslog.syslog(syslog.LOG_DAEMON,
-                                      'Waiting for connection')
+                        logsyslog(LOG_INFO, 'Waiting for connection')
                         soc, soc_addr = self.socket.accept()
-                        syslog.syslog(syslog.LOG_DAEMON, ('Connected to ' +
-                                                          '{addr}').format(
-                                                              addr = soc_addr))
+                        logsyslog(LOG_INFO, ('Connected to {addr}').format(
+                            addr = soc_addr))
 
                     data = soc.recv(self.data_length).decode(
                         self.data_encoding)
                     if data == '':
-                        syslog.syslog(syslog.LOG_DAEMON, 'Closing connection')
+                        logsyslog(LOG_INFO, 'Closing connection')
                         soc.close()
                         continue
 
-                    syslog.syslog(syslog.LOG_DAEMON,
-                                  'Read from socket: {data}'.format(
-                                      data = data))
+                    logsyslog(LOG_INFO, 'Read from socket: {data}'.format(
+                        data = data))
 
                     reply_length_byte_length = 0
                     try:
@@ -251,10 +250,11 @@ class SerialDaemon():
 
                     if not self.serial_context.isOpen():
                         # first time in the loop
-                        syslog.syslog(syslog.LOG_DAEMON, 'Opening serial port')
+                        logsyslog(LOG_INFO, 'Opening serial port')
                         self.serial_context.open()
-                    syslog.syslog(syslog.LOG_DAEMON, 'Sending {data}'.format(
-                            data = data))
+                        
+                    logsyslog(LOG_INFO, 'Sending {data}'.format(
+                        data = data))
                     # discard any input or output
                     self.serial_context.flushOutput()
                     self.serial_context.flushInput()
@@ -263,16 +263,14 @@ class SerialDaemon():
                     # close and reopen instead
                     self.serial_context.close()
                     self.serial_context.open()
-                    syslog.syslog(syslog.LOG_DAEMON, ('Will read {length} ' +
-                                                      'bytes').format(
-                            length = reply_length))
+                    logsyslog(LOG_INFO, ('Will read {length} bytes').format(
+                        length = reply_length))
                     
                     if reply_length > 0:
                         reply = self.serial_context.read(reply_length)
                         reply_decoded = reply.decode(self.data_encoding)
-                        syslog.syslog(syslog.LOG_DAEMON,
-                                      'Received {data}'.format(
-                                          data = reply_decoded))
+                        logsyslog(LOG_INFO, 'Received {data}'.format(
+                            data = reply_decoded))
                         if len(reply_decoded) == reply_length:
                             try:
                                 soc.sendall(reply)
@@ -329,30 +327,29 @@ class SerialDaemon():
                             # value must be numeric and positive
                             val = int(match.group('value'))
                             if val <= 0:
-                                syslog.syslog(syslog.LOG_ERR,
-                                              ('{conf}: Invalid value for ' +
-                                               '{option}').format(
-                                        conf = self.config_file,
-                                        option = opt))
+                                logsyslog(LOG_ERR,
+                                          ('{conf}: Invalid value for ' +
+                                           '{option}').format(
+                                               conf = self.config_file,
+                                               option = opt))
                                 val = getattr(self, opt)
                                 
                         setattr(self, opt, val)
                         
                     else:
-                        syslog.syslog(syslog.LOG_ERR,
-                                      ('{conf}: Invalid syntax at line ' +
-                                       '{line}').format(
-                                conf = self.config_file,
-                                line = line_num))
+                        logsyslog(LOG_ERR, ('{conf}: Invalid syntax at line ' +
+                                            '{line}').format(
+                                                conf = self.config_file,
+                                                line = line_num))
                         
-            syslog.syslog(syslog.LOG_DAEMON,
-                          '{conf} loaded'.format(conf = self.config_file))
+            logsyslog(LOG_INFO, '{conf} loaded'.format(
+                conf = self.config_file))
 
     def start(self):
         """
         Load config, daemonize, connect to serial port, listen on socket port
         """
-        syslog.openlog(ident = self.name, facility = syslog.LOG_DAEMON)
+        opensyslog(ident = self.name, facility = LOG_DAEMON)
         
         self._load_config()
         if self.pidfile_path is not None:
@@ -360,9 +357,8 @@ class SerialDaemon():
         
         if os.path.exists(self.daemon_context.pidfile.path):
             if _pidfile_isbusy(self.daemon_context.pidfile):
-                syslog.syslog(syslog.LOG_ERR,
-                              'Already running (pidfile is locked)')
-                syslog.closelog()
+                logsyslog(LOG_ERR, 'Already running (pidfile is locked)')
+                closesyslog()
                 return
 
         self.daemon_context.open()
@@ -372,14 +368,13 @@ class SerialDaemon():
         # opening the serial port here doesn't work
         # open it in _run instead
         # self.serial_context.open()
-        syslog.syslog(syslog.LOG_DAEMON, 'Started')
+        logsyslog(LOG_INFO, 'Started')
 
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.socket.bind((self.socket_host, self.socket_port))
         self.socket.listen(1)
-        syslog.syslog(syslog.LOG_DAEMON, ('Listening on port ' +
-                                          '{port}').format(
-                port = self.socket_port))
+        logsyslog(LOG_INFO, ('Listening on port {port}').format(
+            port = self.socket_port))
         self._run()
         
     def _stop(self):
@@ -387,7 +382,7 @@ class SerialDaemon():
         if pid is None:
             return
 
-        syslog.syslog(syslog.LOG_DAEMON, 'Stopping')
+        logsyslog(LOG_INFO, 'Stopping')
         self.socket.close()
         if self.serial_context.isOpen():
             self.serial_context.close()
@@ -397,16 +392,15 @@ class SerialDaemon():
         try:
             os.kill(pid, signal.SIGKILL)
         except OSError:
-            syslog.syslog(syslog.LOG_ERR,
-                          'Could not stop process id {pid}'.format(pid = pid))
-        syslog.closelog()
+            logsyslog(LOG_ERR, 'Could not stop process id {pid}'.format(
+                pid = pid))
+        closesyslog()
         
     def _accept_signal(self, sig, frame):
         if sig == signal.SIGHUP:
             self._load_config()
         else:
-            syslog.syslog(syslog.LOG_DAEMON,
-                          'Caught signal {sig}'.format(sig = sig))
+            logsyslog(LOG_INFO, 'Caught signal {sig}'.format(sig = sig))
             self._stop()
             
         
@@ -416,19 +410,17 @@ def _openfile(path, mode = 'r', fail = None):
         file = open(path, mode)
     except IOError as error:
         if repr(error).find('Permission') >= 0:
-            syslog.syslog(syslog.LOG_ERR,
-                          'Cannot {action} {path}. Permission denied.'.format(
-                              action = ('write to' if 'w' in mode else 'read'),
-                              path = path))
+            logsyslog(LOG_ERR,
+                      'Cannot {action} {path}. Permission denied.'.format(
+                          action = ('write to' if 'w' in mode else 'read'),
+                          path = path))
         elif repr(error).find('No such file') >= 0:
-            syslog.syslog(syslog.LOG_ERR,
-                          'No such file or directory: {path}'.format(
-                    path = path))
+            logsyslog(LOG_ERR, 'No such file or directory: {path}'.format(
+                path = path))
         else:
-            syslog.syslog(syslog.LOG_ERR,
-                          'Cannot {action} {path}. Unknown error.'.format(
-                              action = ('write to' if 'w' in mode else 'read'),
-                              path = path))
+            logsyslog(LOG_ERR, 'Cannot {action} {path}. Unknown error.'.format(
+                action = ('write to' if 'w' in mode else 'read'),
+                path = path))
     else:
         return file
     
