@@ -28,7 +28,9 @@ import regex
 import signal
 import socket
 import sys
-from matplotlib import animation, pyplot, ticker
+from matplotlib import rcParams, animation, pyplot, ticker
+from matplotlib.widgets import SpanSelector, Button
+from matplotlib.transforms import Bbox
 from time import time, sleep, strftime
 from optparse import OptionParser, make_option
 from seriald import SerialDaemon
@@ -121,13 +123,156 @@ def plot_realtime(user_input):
         return status
 
     if log_file_path is None:
-        log_file_path = os.path.join(log_dir, '{name}_{date}.log'.format(
+        log_file_path = os.path.join(log_dir, '{name}_{time}.log'.format(
             name = exec_name,
-            date = strftime('%Y-%m-%d_%H-%M-%S')))
+            time = strftime('%Y-%m-%d_%H-%M-%S')))
 
     soc = connect_to_socket()
+
+    rcParams['toolbar'] = 'None'
+    
+    ################################### MISC ##################################
+    
+    # find positions of items in the sorted  array U item[i]
+    # ala numpy's searchsorted
+    # both arguments must support subscripting and all items must be numeric
+    def searchsorted(array, items):
+        try:
+            items[0]
+        except TypeError:
+            items  = [ items ]
+            
+        # default position is at the end of array
+        items_indices = [len(array)] * len(items)
+        for i in range(len(array)):
+            for j in range(len(items)):
+                if array[i] >= items[j] and items_indices[j] == len(array):
+                    # found a position inside array for item j
+                    items_indices[j] = i
+    
+        return items_indices
+    
+    ############################ BUTTON AND EVENTS ############################
+    
+    # mouse was moved
+    def mouse_onmove(event):
+        if event.xdata is None:
+            return
         
-    def data_get():
+        coords_label.set_text('x = {x:.3f}, y = {y:.3f}'.format(
+            x = event.xdata,
+            y = event.ydata
+        ))
+    
+    # span selection completed
+    def span_onselect(xmin, xmax):
+        run.pause = False
+        imin, imax = searchsorted(xdata, (xmin, xmax))
+        imax = min(len(xdata) - 1, imax)
+        imin = min(len(xdata) - 1, imin)
+    
+        if imin == imax:
+            return
+        
+        ymin, ymax = axes.get_ylim()
+        ylim_padding_abs = ylim_padding * (ymax - ymin)
+        thisx = xdata[imin:imax]
+        thisy = ydata[imin:imax]
+        line_lower.set_data(thisx, thisy)
+        axes_lower.set_xlim(thisx[0], thisx[-1])
+        axes_lower.set_ylim(
+            min(thisy) - ylim_padding_abs,
+            max(thisy) + ylim_padding_abs
+        )
+    
+    # mouse was movied while span selection was active
+    def span_onmove(xmin, xmax):
+        run.pause = True
+    
+    # clear both graphs
+    def clear_graphs(event):
+        del xdata[:]
+        del ydata[:]
+        run.miny, run.maxy = None, None
+        line.set_data(xdata, ydata)
+        line_lower.set_data(xdata, ydata)
+        pyplot.draw()
+    
+    # save figure to file
+    def save_image(event):
+        axes_extent = axes.get_window_extent().transformed(
+            fig.dpi_scale_trans.inverted())
+        axes_lower_extent = axes_lower.get_window_extent().transformed(
+            fig.dpi_scale_trans.inverted())
+        fig_width, fig_height = fig.get_size_inches()
+        vpadding = 0.5    # in inches
+        fig.savefig(
+            '{cmd}_full_range_{time}.png'.format(
+                cmd = cmd,
+                time = strftime('%Y-%m-%d_%H-%M-%S')),
+            bbox_inches = Bbox.from_bounds(
+                0,
+                axes_extent.bounds[1] - vpadding,
+                fig_width,
+                axes_extent.bounds[3] + 2 * vpadding)) # include title
+        fig.savefig(
+            '{cmd}_zoomed_range_{time}.png'.format(
+                cmd = cmd,
+                time = strftime('%Y-%m-%d_%H-%M-%S')),
+            bbox_inches = Bbox.from_bounds(
+                0,
+                axes_lower_extent.bounds[1] - vpadding,
+                fig_width,
+                axes_lower_extent.bounds[3] + 1.2 * vpadding))
+    
+    # window was resized
+    def resize_objects(event = None):
+        # in pixels
+        toolbar_hpos = 20
+        toolbar_vpos = 10
+        button_width = 40
+        button_height = 25
+        button_padding = 20
+        coords_label_width = 130
+        
+        left_margin = 60
+        right_margin = 30
+        top_margin = 40
+        bottom_margin = 80
+        plot_padding = 140
+        fig_width, fig_height = fig.canvas.get_width_height()
+        
+        # convert to fractions
+        pyplot.subplots_adjust(
+            left = left_margin / fig_width,
+            bottom = bottom_margin / fig_height,
+            right = 1 - right_margin / fig_width,
+            top = 1 - top_margin / fig_height,
+            wspace = 0,
+            hspace = plot_padding / fig_height
+        )
+        button_clear.ax.set_position([
+            toolbar_hpos / fig_width,
+            toolbar_vpos / fig_height,
+            button_width / fig_width,
+            button_height / fig_height
+        ])
+        button_save.ax.set_position([
+            (toolbar_hpos + button_width + button_padding ) / fig_width,
+            toolbar_vpos / fig_height,
+            button_width / fig_width,
+            button_height / fig_height
+        ])
+        coords_label.axes.set_position([
+            1 - (coords_label_width + right_margin) / fig_width,
+            toolbar_vpos / fig_height,
+            coords_label_width / fig_width,
+            button_height / fig_height
+        ])
+    
+    ################################### DATA ##################################
+    
+    def new_data():
         start_time = time()
         cur_time = 0
         
@@ -144,63 +289,115 @@ def plot_realtime(user_input):
                     continue
 
                 data = float(data)
-                log_file.write('{time!s}\t{data!s}\n'.format(
+                log_file.write('{time:.3f}\t{data!s}\n'.format(
                     time = cur_time,
                     data = data))
                 if cur_time == 0:
-                    axes.set_ylim(data - 0.01, data + 0.01)
+                    ymin, ymax = axes.get_ylim()
+                    ylim_padding_abs = ylim_padding * (ymax - ymin)
+                    axes.set_ylim(
+                        data - ylim_padding_abs,
+                        data + ylim_padding_abs
+                    )
                     
                 yield cur_time, data
                 cur_time = time() - start_time
-                
+    
+    def run(data):
+        # update the data
+        x, y = data
+        if None in (run.maxy, run.miny):
+            run.miny = run.maxy = y
             
-    def run(new_data):
-        x, y = new_data
         xdata.append(x)
         ydata.append(y)
-        xmin, xmax = axes.get_xlim()
-        ymin, ymax = axes.get_ylim()
-
-        if x > xmax:
-            axes.set_xlim(xmin, x)
-        if y > ymax:
-            axes.set_ylim(ymin, y)
-        elif y < ymin:
-            axes.set_ylim(y, ymax)
+        if len(xdata) > max_data_points:
+            xdata.pop(0)
+            ypop = ydata.pop(0)
+            if ypop == run.maxy:
+                run.maxy = max(ydata)
+            elif ypop == run.miny:
+                run.miny = min(ydata)
             
-        curve.set_data(xdata, ydata)
-        axes.figure.canvas.draw()
-
-        return curve,
-
-    fig, axes = pyplot.subplots()
-    curve, = axes.plot([], [], lw = 2)
-    y_formatter = ticker.ScalarFormatter(useOffset = False)
-    axes.yaxis.set_major_formatter(y_formatter)
-    # y limit is set in data_gen
-    axes.set_xlim(0, 1)
-    axes.set_title(cmd)
-    axes.set_xlabel('Time / s')
-    axes.set_ylabel('')
-    axes.grid()
+        if not run.pause:
+            run.maxy = max(run.maxy, y)
+            run.miny = min(run.miny, y)
+            axes.set_xlim(xdata[0], x)
+            ymin, ymax = axes.get_ylim()
+            ylim_padding_abs = ylim_padding * (ymax - ymin)
+            axes.set_ylim(
+                run.miny - ylim_padding_abs,
+                run.maxy + ylim_padding_abs
+            )
+            line.set_data(xdata, ydata)
+    
+        return line,
+    
+    ################################### INIT ##################################
+    
+    max_data_points = 500
+    ylim_padding = 0.1    # y-limit padding in fraction of range
     xdata, ydata = [], []
-
+    fig = pyplot.figure()
+    axes = fig.add_subplot(211, axisbg = '#FFFFFF')       # full plot
+    axes_lower = fig.add_subplot(212, axisbg = '#FFFFFF') # user selection
+    line, = axes.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
+    line_lower, = axes_lower.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
+    y_formatter = ticker.FormatStrFormatter('%.3f')
+    axes.set_title(cmd)
+    for ax in (axes, axes_lower):
+        ax.set_xlim(0, 1)
+        ax.set_xlabel('Time / s')
+        ax.set_ylabel('')
+        ax.yaxis.set_major_formatter(y_formatter)
+        ax.grid()
+    run.pause = False
+    run.maxy = None
+    run.miny = None
+    coords_label = pyplot.text(
+        0,
+        0,
+        'x = {x:.3f}, y = {y:.3f}'.format(
+            x = 0,
+            y = 0
+        ),
+        transform = pyplot.axes([0, 0, 0, 0.2]).transAxes
+    )
+    coords_label.axes.set_axis_off()
+    
+    button_clear = Button(
+        pyplot.axes([0, 0, 0, 0]),
+        'Clear'
+    )
+    button_clear.on_clicked(clear_graphs)
+    button_save = Button(
+        pyplot.axes([0, 0, 0, 0.1]),
+        'Save'
+    )
+    button_save.on_clicked(save_image)
+    
+    span = SpanSelector(
+        axes,
+        span_onselect,
+        'horizontal',
+        onmove_callback = span_onmove,
+        rectprops = {
+            'alpha': 0.5,
+            'facecolor': 'red'
+        })
+    
     anim = animation.FuncAnimation(
         fig,
         run,
-        frames = data_get,
+        frames = new_data,
         blit = False,
         interval = 10,
         repeat = False
-        )
-    pyplot.subplots_adjust(
-        left = 0.09,
-        bottom = 0.09,
-        right = 0.97,
-        top = 0.95,
-        wspace = 0,
-        hspace = 0
     )
+    
+    resize_objects()
+    fig.canvas.mpl_connect('resize_event', resize_objects)
+    fig.canvas.mpl_connect('motion_notify_event', mouse_onmove)
     try:
         pyplot.show()
     except KeyboardInterrupt:

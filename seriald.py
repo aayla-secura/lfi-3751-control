@@ -194,10 +194,10 @@ class SerialDaemon():
         if self.daemon_context is None:
             self.daemon_context = DaemonContext(
                 signal_map = {
-                    signal.SIGHUP: self._accept_signal,
-                    signal.SIGINT: self._accept_signal,
-                    signal.SIGQUIT: self._accept_signal,
-                    signal.SIGTERM: self._accept_signal,
+                    signal.SIGHUP: self.__accept_signal,
+                    signal.SIGINT: self.__accept_signal,
+                    signal.SIGQUIT: self.__accept_signal,
+                    signal.SIGTERM: self.__accept_signal,
                 }
             )
             for attr in filter(lambda s: not s.startswith('_'),
@@ -213,7 +213,7 @@ class SerialDaemon():
                 if kwargs.get(attr) is not None:
                     setattr(self.serial_context, attr, kwargs.get(attr))
                     
-    def _run(self):
+    def __run(self):
 
         with open(self.log_file, 'a') as log_file:
             try:
@@ -281,9 +281,9 @@ class SerialDaemon():
             except:
                 traceback.print_exc(file = log_file)
                 
-        self._stop()
+        self.__stop()
                 
-    def _load_config(self):
+    def __load_config(self):
         if self.config_file is not None:
             conf = _openfile(self.config_file, 'r')
             
@@ -351,7 +351,7 @@ class SerialDaemon():
         """
         opensyslog(ident = self.name, facility = LOG_DAEMON)
         
-        self._load_config()
+        self.__load_config()
         if self.pidfile_path is not None:
             self.daemon_context.pidfile = lockfile.FileLock(self.pidfile_path)
         
@@ -363,10 +363,10 @@ class SerialDaemon():
 
         self.daemon_context.open()
         with _openfile(self.daemon_context.pidfile.path, 'w',
-                      fail = self._stop) as file:
+                      fail = self.__stop) as file:
             file.write('{pid}'.format(pid = os.getpid()))
         # opening the serial port here doesn't work
-        # open it in _run instead
+        # open it in __run instead
         # self.serial_context.open()
         logsyslog(LOG_INFO, 'Started')
 
@@ -375,9 +375,9 @@ class SerialDaemon():
         self.socket.listen(1)
         logsyslog(LOG_INFO, ('Listening on port {port}').format(
             port = self.socket_port))
-        self._run()
+        self.__run()
         
-    def _stop(self):
+    def __stop(self):
         pid = _get_pid(self.daemon_context.pidfile.path)
         if pid is None:
             return
@@ -396,12 +396,12 @@ class SerialDaemon():
                 pid = pid))
         closesyslog()
         
-    def _accept_signal(self, sig, frame):
+    def __accept_signal(self, sig, frame):
         if sig == signal.SIGHUP:
-            self._load_config()
+            self.__load_config()
         else:
             logsyslog(LOG_INFO, 'Caught signal {sig}'.format(sig = sig))
-            self._stop()
+            self.__stop()
             
         
 def _openfile(path, mode = 'r', fail = None):
