@@ -22,6 +22,9 @@
 # A control file for the LFI-3751 temperature controller
 # Requires seriald, regex and matplotlib
 
+# to do:
+# deal with corrupt device reply
+
 import os
 import random
 import regex
@@ -92,16 +95,20 @@ def reload_config(*args):
 
 # must return 0 on success
 def interact(*args):
-    prompt = """Enter "command value [address]".
-    Values are optional, their presence indicates a write command.
-    Address is optional, defaults to 1.
-    Enter to quit.
-    """
+    prompt = 'Enter "command value [address]".\nValues are optional, ' + \
+             'their presence indicates a write command.\n' + \
+             'Address is optional, defaults to 1.\nEnter to quit.'
 
     soc = connect_to_socket()
     try:
+        print(prompt)
         while True:
-            status, cmd, val, addr = process_input(input(prompt).split(' '))[0:4]
+            user_input = input()
+            if user_input == '':
+                break
+            status, cmd, val, addr = process_input(
+                user_input.split(' ')
+            )[0:4]
             if status == 0:
                 if cmd is not None:
                     send_cmd(cmd, val, addr, soc)
@@ -115,16 +122,22 @@ def interact(*args):
 
 # must return 0 on success
 def plot_realtime(user_input):
-    # user_input[0] will be 'plot', discard it
-    status, cmd, val, addr, interval, \
-        log_file_path, log_dir = process_input(user_input[1:])
+    # user_input[0] will be 'plot', discard it; val is not used
+    status, cmds, val, addr, interval, log_file_path, log_dir, \
+        no_log = process_input(user_input[1:], multi_cmds = True)
     
     if status != 0:
         return status
 
-    if log_file_path is None:
-        log_file_path = os.path.join(log_dir, '{name}_{time}.log'.format(
-            name = exec_name,
+    if len(cmds) == 0:
+        cmds = ['ACT_T', 'TE_I', 'TE_V']
+
+    if no_log:
+        log_file_path = os.devnull
+        del cmds[1:]		# no need to send additional commands
+    elif log_file_path is None:
+        log_file_path = os.path.join(log_dir, '{cmd}_{time}.log'.format(
+            cmd = cmds[0],
             time = strftime('%Y-%m-%d_%H-%M-%S')))
 
     soc = connect_to_socket()
@@ -208,7 +221,7 @@ def plot_realtime(user_input):
         vpadding = 0.5    # in inches
         fig.savefig(
             '{cmd}_full_range_{time}.png'.format(
-                cmd = cmd,
+                cmd = cmds[0],
                 time = strftime('%Y-%m-%d_%H-%M-%S')),
             bbox_inches = Bbox.from_bounds(
                 0,
@@ -217,7 +230,7 @@ def plot_realtime(user_input):
                 axes_extent.bounds[3] + 2 * vpadding)) # include title
         fig.savefig(
             '{cmd}_zoomed_range_{time}.png'.format(
-                cmd = cmd,
+                cmd = cmds[0],
                 time = strftime('%Y-%m-%d_%H-%M-%S')),
             bbox_inches = Bbox.from_bounds(
                 0,
@@ -233,7 +246,7 @@ def plot_realtime(user_input):
         button_width = 40
         button_height = 25
         button_padding = 20
-        coords_label_width = 130
+        coords_label_width = 150
         
         left_margin = 60
         right_margin = 30
@@ -277,31 +290,48 @@ def plot_realtime(user_input):
         cur_time = 0
         
         with open(log_file_path, 'a') as log_file:
+            log_file.write('#{headline}\n'.format(
+                headline = '\t'.join(cmds)))
             while True:
-                status, data = send_cmd(cmd, val, addr, soc, verbose = False)
-                sleep(interval)
-                
-                if status == 1:
-                    # argument processing did not succeed, abort
-                    break
-                if status == 2:
-                    # reading reply from device did not succeed, ignore
+                data = []
+                for cmd in cmds:
+                    status, val = send_cmd(
+                        cmd,
+                        '',
+                        addr,
+                        soc,
+                        verbose = False
+                    )
+                    
+                    if status == 1:
+                        # argument processing did not succeed, abort
+                        return
+                    if status == 2:
+                        # reading reply from device did not succeed, ignore
+                        data.append('null')
+                        continue
+
+                    data.append(val)
+
+                if data[0] == 'null':
                     continue
 
-                data = float(data)
-                log_file.write('{time:.3f}\t{data!s}\n'.format(
+                log_file.write('{time:.3f}\t{data}\n'.format(
                     time = cur_time,
-                    data = data))
+                    data = '\t'.join(data)))
+                
+                plot_data = float(data[0])
                 if cur_time == 0:
                     ymin, ymax = axes.get_ylim()
                     ylim_padding_abs = ylim_padding * (ymax - ymin)
                     axes.set_ylim(
-                        data - ylim_padding_abs,
-                        data + ylim_padding_abs
+                        plot_data - ylim_padding_abs,
+                        plot_data + ylim_padding_abs
                     )
                     
-                yield cur_time, data
                 cur_time = time() - start_time
+                yield cur_time, plot_data
+                sleep(interval)
     
     def run(data):
         # update the data
@@ -344,7 +374,7 @@ def plot_realtime(user_input):
     line, = axes.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
     line_lower, = axes_lower.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
     y_formatter = ticker.FormatStrFormatter('%.3f')
-    axes.set_title(cmd)
+    axes.set_title(cmds[0])
     for ax in (axes, axes_lower):
         ax.set_xlim(0, 1)
         ax.set_xlabel('Time / s')
@@ -570,48 +600,53 @@ def generate_cmd(cmd, val, addr):
 ##################################### MISC ####################################
 ###############################################################################
 
-def process_input(user_input):
+def process_input(user_input, multi_cmds = False):
     opts, args = opt_parser.parse_args(user_input)
 
-    if len(args) == 0:
-        return 0, None, None, None, None, None, None
-
-    cmd = args[0].upper()
     address = opts.address
     interval = opts.interval
     log_file = opts.log_file
     log_dir = opts.log_dir
-    
-    if cmd == 'HALT' or cmd == 'LOCAL':
-        # user does not provide value for this operation
-        # but operation is still 'write'
-        args.insert(1, '+000.000')
-
-    if not 1 <= len(args) <= 2:
-        usage()
+    no_log = opts.no_log
 
     if not min_unit_address <= address <= max_unit_address:
         print(('Unit address must be between {min} and {max}! ' +
                'Aborting.').format(min = min_unit_address,
                                    max = max_unit_address),
               file = sys.stderr)
-        return 1, None, None, None, None, None, None
+        return 1, None, None, None, None, None, None, None
     address = '{!s:0>2}'.format(address)
 
     if interval < 0:
         print('Check interval cannot be negative!', file = sys.stderr)
-        return 1, None, None, None, None, None, None
+        return 1, None, None, None, None, None, None, None
 
     if log_dir != '':
         if not os.path.isdir(log_dir):
             os.mkdir(log_dir, mode = 0o755)
-            
-    if len(args) == 2:
-        val = args[1]
-    else:
-        val = ''
 
-    return 0, cmd, val, address, interval, log_file, log_dir
+    if multi_cmds:
+        # value is not used if multiple commands are given
+        return 0, [el.upper() for el in args], None, address, \
+            interval, log_file, log_dir, no_log
+    elif len(args) > 0:
+        cmd = args[0].upper()
+        if cmd == 'HALT' or cmd == 'LOCAL':
+            # user does not provide value for this operation
+            # but operation is still 'write'
+            args.insert(1, '+000.000')
+
+        if not 1 <= len(args) <= 2:
+            usage()
+
+        if len(args) == 2:
+            val = args[1]
+        else:
+            val = ''
+
+        return 0, cmd, val, address, interval, log_file, log_dir, no_log
+    else:
+        return 0, None, None, address, interval, log_file, log_dir, no_log
 
 def usage():
     process_input(['--help'])
@@ -624,39 +659,44 @@ def usage():
 exec_name = os.path.basename(__file__)
 allowed_actions = {
     'start': {
-        'usage': 'start',
+        'usage': '1* Daemon actions:\n  %prog start',
         'callable': start,
         'num_args': [ 0 ]
     },
     'stop': {
-        'usage': 'stop',
+        'usage': '2  %prog stop',
         'callable': stop,
         'num_args': [ 0 ]
     },
     'restart': {
-        'usage': 'restart',
+        'usage': '3  %prog restart',
         'callable': restart,
         'num_args': [ 0 ]
     },
     'reload': {
-        'usage': 'reload',
+        'usage': '4  %prog reload',
         'callable': reload_config,
         'num_args': [ 0 ]
     },
+    'single': {
+        'usage': '5* Send single command to device\n' + \
+            '  %prog <command> [<value>] [--address]',
+        'callable': onetime_action,
+        'num_args': range(0,3)
+    },
     'interact': {
-        'usage': 'interact',
+        'usage': '6* Read commands from stdin\n  %prog interact',
         'callable': interact,
         'num_args': [ 0 ]
     },
     'plot': {
-        'usage': 'plot <command> [--address] [--interval] [--log-file|--log-dir]',
+        'usage': '7* Plot reply from first command vs time and log time + ' + \
+            'replies for all given commands to file\n' + \
+            'By default it plots ACT_T and logs TE_V, TE_I as well.\n' + \
+            '  %prog plot [<command> ...] [--address] [--interval] ' + \
+            '[--log-file|--log-dir|--no-log]',
         'callable': plot_realtime,
-        'num_args': range(1,5)
-    },
-    'single': {
-        'usage': '<command> [<value>] [--address]',
-        'callable': onetime_action,
-        'num_args': range(0,3)
+        'num_args': None
     }
 }
 
@@ -933,11 +973,11 @@ cmds = {
     }
 }
 
-usage_msg = ('\n%prog {actions}\n\n' + \
+usage_msg = ('\n{actions}\n\n' + \
              'Available commands (case-insensitive):\n{cmds}').format(
-                 actions = '\n%prog '.join(
-                     sorted([ allowed_actions[key]['usage'] \
-                       for key in allowed_actions.keys() ])
+                 actions = '\n'.join(
+                     [el[1:] for el in sorted([ allowed_actions[key]['usage'] \
+                       for key in allowed_actions.keys() ])]
                  ),
                  cmds = ', '.join(cmds.keys()))
 opt_parser = OptionParser(
@@ -946,8 +986,8 @@ opt_parser = OptionParser(
         make_option('-a', '--address',
                     type = 'int',
                     dest = 'address',
-                    help = ('Address of unit: {min} to {max}. ' + \
-                            'Default is {default}.').format(
+                    help = ('address of unit: {min} to {max}; ' + \
+                            'default is {default}.').format(
                                 min = min_unit_address,
                                 max = max_unit_address,
                                 default = default_unit_address),
@@ -957,9 +997,8 @@ opt_parser = OptionParser(
         make_option('-i', '--interval',
                     type = 'float',
                     dest = 'interval',
-                    help = ('Only used for plotting: number of seconds ' + \
-                            'between data points. ' + \
-                            'Default is {default}.').format(
+                    help = ('number of seconds between data points; ' + \
+                            'default is {default}.').format(
                                 default = default_plot_interval),
                     metavar = 'SECONDS',
                     default = default_plot_interval
@@ -967,19 +1006,25 @@ opt_parser = OptionParser(
         make_option('-l', '--log-file',
                     type = 'string',
                     dest = 'log_file',
-                    help = ('Only used for plotting: path to log file. ' + \
-                            'Default is ./{name}_<date_time>.log').format(
-                                name = exec_name),
+                    help = ('path to log file; ' + \
+                            'default is ./<command>_<date>_<time>.log'),
                     metavar = 'FILE'
                 ),
         make_option('-d', '--log-dir',
                     type = 'string',
                     dest = 'log_dir',
-                    help = 'Only used for plotting: base directory ' + \
-                    "for log files. Default is '.'. This option is " + \
-                    'ignored if --log-file is present.',
+                    help = ('base directory for log files; ' + \
+                            "default is '.'; this option is " + \
+                            'ignored if --log-file is present.'),
                     metavar = 'DIR',
                     default = ''
+                ),
+        make_option('-n', '--no-log',
+                    action = 'store_true',
+                    dest = 'no_log',
+                    help = ('do not log; --log-file and --log-dir ' + \
+                            'options are ignored if this option is present.'),
+                    default = False
                 )
         ]
     )
@@ -1004,7 +1049,8 @@ if action.upper() in cmds.keys():
 if action not in allowed_actions.keys():
     usage()
 
-if len(sys.argv) - 2 not in allowed_actions[action]['num_args']:
+if allowed_actions[action]['num_args'] is not None \
+   and len(sys.argv) - 2 not in allowed_actions[action]['num_args']:
     usage()
 
 status = allowed_actions[action]['callable'](sys.argv[1:])
