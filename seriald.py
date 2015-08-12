@@ -136,6 +136,13 @@ class SerialDaemon():
         Valid encoding (accepted by the str.decode() and bytes() methods) for
         the data read from and sent to the socket.
 
+    reply_length_strict
+        :Default: ``False``
+
+        If True daemon will not send data read from device unless the length
+        matches the expected reply length given as part of the data sent over
+        the socket. See above for details on the data format.
+
     daemon_context
         :Default: ``None``
 
@@ -163,6 +170,7 @@ class SerialDaemon():
             socket_port = 57001,
             socket_host = '',		# all available interfaces
             data_length = 1024,
+            reply_length_strict = False,
             data_encoding = 'utf-8',
             daemon_context = None,
             serial_context = None,
@@ -188,6 +196,7 @@ class SerialDaemon():
         self.socket_port = socket_port
         self.socket_host = socket_host
         self.data_length = data_length
+        self.reply_length_strict = reply_length_strict
         self.data_encoding = data_encoding
         
         self.daemon_context = daemon_context
@@ -271,7 +280,8 @@ class SerialDaemon():
                         reply_decoded = reply.decode(self.data_encoding)
                         logsyslog(LOG_INFO, 'Received {data}'.format(
                             data = reply_decoded))
-                        if len(reply_decoded) == reply_length:
+                        if len(reply_decoded) == reply_length \
+                           or not self.reply_length_strict:
                             try:
                                 soc.sendall(reply)
                             except ConnectionResetError:
