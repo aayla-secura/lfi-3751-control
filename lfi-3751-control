@@ -74,6 +74,7 @@ def start(user_input):
         usage()
         
     socket_port = user_dict['port']
+    serial_port = user_dict['device']
         
     daemon = SerialDaemon(
         name = exec_name,
@@ -804,6 +805,7 @@ def process_input(user_input, multi_cmds = False):
     opts, args = opt_parser.parse_args(user_input)
 
     port = opts.port
+    device = opts.device
     address = opts.address
     interval = opts.interval
     log_file = opts.log_file
@@ -815,6 +817,13 @@ def process_input(user_input, multi_cmds = False):
     
     if port < 1:
         print('Port number must be positive!', file = sys.stderr)
+        return 1, {}
+
+    if device[0] != '/':
+        device = '/dev/{tty}'.format(tty = device)
+    if not os.path.exists(device):
+        print('No such file {tty}! Aborting'.format(tty = device),
+              file = sys.stderr)
         return 1, {}
     
     if not min_unit_address <= address <= max_unit_address:
@@ -844,6 +853,7 @@ def process_input(user_input, multi_cmds = False):
         # value is not used if multiple commands are given
         return 0, { 'commands': [el.upper() for el in args],
                     'port': port,
+                    'device': device,
                     'address': address,
                     'interval': interval,
                     'log_file': log_file,
@@ -870,6 +880,7 @@ def process_input(user_input, multi_cmds = False):
         return 0, { 'command': cmd,
                     'value': val,
                     'port': port,
+                    'device': device,
                     'address': address,
                     'interval': interval,
                     'log_file': log_file,
@@ -882,6 +893,7 @@ def process_input(user_input, multi_cmds = False):
         return 0, { 'command': None,
                     'value': None,
                     'port': port,
+                    'device': device,
                     'address': address,
                     'interval': interval,
                     'log_file': log_file,
@@ -1233,6 +1245,15 @@ opt_parser = OptionParser(
                                 default = socket_port),
                     metavar = 'PORT',
                     default = socket_port
+        ),
+        make_option('-D', '--device',
+                    type = 'string',
+                    dest = 'device',
+                    help = ('serial device file descriptor; ' + \
+                            'default is {default}.').format(
+                                default = serial_port),
+                    metavar = 'DEV',
+                    default = serial_port
         ),
         make_option('-a', '--address',
                     type = 'int',

@@ -268,10 +268,29 @@ class SerialDaemon():
                     self.serial_context.flushOutput()
                     self.serial_context.flushInput()
                     self.serial_context.write(bytes(data, self.data_encoding))
-                    # flush doesn't work in daemon mode
+                    # flush doesn't work in daemon mode for ttyS?
                     # close and reopen instead
-                    self.serial_context.close()
-                    self.serial_context.open()
+                    is_ttyS = True
+                    try:
+                        # is it a number? Serial defaults to /dev/ttyS? if so
+                        self.serial_context.port += 0
+                    except TypeError:
+                        # not a number, assume string
+                        try:
+                            if not self.serial_context.port.startswith(
+                                    '/dev/ttyS'):
+                                raise AttributeError
+                        except AttributeError:
+                            # not a string or not a ttyS? device
+                            # assume flushing works
+                            is_ttyS = False
+                    finally:
+                        if is_ttyS:
+                            self.serial_context.close()
+                            self.serial_context.open()
+                        else:
+                            self.serial_context.flush()
+                            
                     logsyslog(LOG_INFO, ('Will read {length} bytes').format(
                         length = reply_length))
                     
