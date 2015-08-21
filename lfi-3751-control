@@ -37,11 +37,12 @@ import sys
 from matplotlib import rcParams, animation, pyplot, ticker
 from matplotlib.widgets import SpanSelector, Button
 from matplotlib.transforms import Bbox
-from statistics import mean
-from time import time, sleep, strftime
+from glob import iglob
 from optparse import OptionParser, make_option
 from seriald import SerialDaemon
 from serial import Serial, EIGHTBITS, PARITY_NONE, STOPBITS_ONE
+from statistics import mean
+from time import time, sleep, strftime
 
 exec_name = os.path.basename(__file__)
 pidfile = '/var/run/{name}_<socket_port>.pid'.format(name = exec_name)
@@ -208,41 +209,46 @@ def response_curve(user_input):
 
 # must return 0 on success
 def plot(user_input, response_curve = False):
-    # user_input[0] will be 'plot', discard it
-    status, user_dict = process_input(user_input[1:], multi_cmds = True)
-    
-    if status != 0:
-        return status
-    
-    query_cmds, addr, interval, port, log_file_path, log_dir, no_log, \
-        temp_step, start_temp, stop_temp = [
-            user_dict[key] for key in ['commands', 'address', 'interval',
-                                       'port', 'log_file', 'log_dir', 'no_log',
-                                       'temp_step', 'start_temp', 'stop_temp']
-    ]
-
-    if len(query_cmds) == 0:
-        query_cmds = ['ACT_T', 'TE_I', 'TE_V']
-    elif response_curve and query_cmds[0] != 'ACT_T':
-        query_cmds.insert(0, 'ACT_T')
-
-    if no_log:
-        log_file_path = os.devnull
-        del query_cmds[1:]		# no need to send additional commands
-    elif log_file_path is None:
-        log_file_path = os.path.join(log_dir,
-                                     '{cmd}_unit{addr}_{time}.log'.format(
-            cmd = query_cmds[0],
-            addr = addr,
-            time = strftime('%Y-%m-%d_%H-%M-%S')))
-
-    soc = connect_to_socket(port)
-    
-    rcParams['toolbar'] = 'None'
     
     ################################### MISC ##################################
     
-    # find positions of items in the sorted  array U item[i]
+    # find the last modified log file for this unit
+    # this assumes the filename contains 'unit<id> and ends with .log'
+    def find_last_modified():
+        if log_dir:
+            root = '{root}/'.format(root = log_dir)
+        else:
+            root = ''
+
+        files = iglob('{root}*unit{addr}*.log'.format(
+            root = root,
+            addr = addr))
+
+        try:
+            last_file_path = max(files, key = os.path.getmtime)
+        except ValueError:
+            # no matching files
+            return None, []
+
+        with open(last_file_path, mode = 'r') as last_file:
+            headline = last_file.readline()[1:]
+
+        cmds = [cmd for cmd in headline.split()
+                if cmd not in ['time/s', 'SET_T']]
+
+        return last_file_path, cmds
+        
+    # read in time of last data point from the log we're appending to
+    def get_last_timestamp(log_path, time_field = 0):
+        with open(log_path, mode = 'rb') as log_file:
+            # jump to the second last byte and look backwards for newline
+            log_file.seek(-2, os.SEEK_END)
+            while log_file.read(1) != b'\n':
+                log_file.seek(-2, os.SEEK_CUR)
+            return float(log_file.readline().split()[time_field])
+            
+    
+    # find positions of items in the sorted array U item[i]
     # ala numpy's searchsorted
     # both arguments must support subscripting and all items must be numeric
     def searchsorted(array, items):
@@ -253,11 +259,11 @@ def plot(user_input, response_curve = False):
             
         # default position is at the end of array
         items_indices = [len(array)] * len(items)
-        for i in range(len(array)):
-            for j in range(len(items)):
-                if array[i] >= items[j] and items_indices[j] == len(array):
+        for array_id, array_el in enumerate(array):
+            for item_id, item in enumerate(items):
+                if array_el >= item and items_indices[item_id] == len(array):
                     # found a position inside array for item j
-                    items_indices[j] = i
+                    items_indices[item_id] = array_id
     
         return items_indices
     
@@ -344,9 +350,9 @@ def plot(user_input, response_curve = False):
         button_padding = 20
         coords_label_width = 150
         
-        left_margin = 60
+        left_margin = 80
         right_margin = 30
-        top_margin = 40
+        top_margin = 20
         bottom_margin = 80
         plot_padding = 140
         fig_width, fig_height = fig.canvas.get_width_height()
@@ -380,8 +386,23 @@ def plot(user_input, response_curve = False):
         ])
     
     ################################### DATA ##################################
-    
-    def get_data(query, known = [], log_file = None):
+
+    # write headline to log files
+    def init_logs():
+        if log_to_old:
+            return
+        
+        if response_curve:
+            log_file.write('#time/s\tSET_T\t{data}\n'.format(
+                data = '\t'.join(query_cmds)))
+            log_file_resp.write('#time/s\tSET_T\tACT_T\tact_t_avg' + \
+                                '\tact_t_delta\tsample_time\n')
+        else:
+            log_file.write('#time/s\t{data}\n'.format(
+                data = '\t'.join(query_cmds)))
+
+    # get requested data
+    def get_data(query, known = []):
         while True:
             data = []
             for cmd in query:
@@ -403,108 +424,93 @@ def plot(user_input, response_curve = False):
             if data[0] == 'null':
                 continue
 
-            if log_file is not None:
-                known = ['{:.3f}'.format(el) for el in known]
-                log_file.write('{known}\t{data}\n'.format(
-                    known = '\t'.join(known),
-                    data = '\t'.join(data)))
+            known = ['{:.3f}'.format(el) for el in known]
+            log_file.write('{known}\t{data}\n'.format(
+                known = '\t'.join(known),
+                data = '\t'.join(data)))
 
             return float(data[0])
 
+    # response curve data specifics, response_curve is True
     def get_response():
         set_temp = start_temp
-        start_time = time()
-        cur_time = 0
+        if log_to_old:
+            start_time = time() - time_offset - interval
+        else:
+            start_time = time() - time_offset
         
-        with open(log_file_path,
-                  mode = 'a',
-                  buffering = 1) as log_file, \
-             open('_response.'.join(log_file_path.rsplit('.', 1)),
-                  mode = 'a',
-                  buffering = 1) as log_file_resp:
+        while (temp_step > 0 and set_temp <= stop_temp) \
+              or (temp_step < 0 and set_temp >= stop_temp):
+            send_cmd(
+                'SET_T',
+                '{temp!s}'.format(temp = set_temp),
+                addr,
+                socket = soc,
+                verbose = False
+            )
+            temp_history = []
+            error_samples = 10       # number of previous samples to look at
+            max_error = 0.5 / 1000   # stabilize to that temp in C (per sample)
             
-            log_file.write('#time/s\tSET_T\t{data}\n'.format(
-                data = '\t'.join(query_cmds)))
-            log_file_resp.write('#time/s\tSET_T\tACT_T\tact_t_avg' + \
-                                '\tact_t_delta\tsample_time\n')
-            
-            while (temp_step > 0 and set_temp <= stop_temp) \
-                  or (temp_step < 0 and set_temp >= stop_temp):
-                send_cmd(
-                    'SET_T',
-                    '{temp!s}'.format(temp = set_temp),
-                    addr,
-                    socket = soc,
-                    verbose = False
-                )
-                temp_history = []
-                error_samples = 10    # number of previous samples to look at
-                max_error = 5 / 1000  # stabilize to that temp in C
-                
-                # wait until temperature stabilizes
-                meas_start_time = time()
-                timeout = 300         # in seconds
-                while True:
-                    act_temp = get_data(
-                        query_cmds,
-                        known = [cur_time, set_temp],
-                        log_file = log_file
-                    )
-                    if len(temp_history) >= error_samples:
-                        error = 0
-                        for prev_temp in temp_history:
-                            error += abs(act_temp - prev_temp)
-                            
-                        if error <= max_error:
-                            break
-                        
-                        temp_history.pop(0)
-                        
-                    temp_history.append(act_temp)
-                    sleep(interval)
-                    cur_time = time() - start_time
-                    meas_time = time() - meas_start_time
-                    if meas_time > timeout:
-                        break
-
-                log_file_resp.write(
-                    ('{time:.3f}\t{set_t:.3f}\t{act_t:.3f}\t{act_t_avg:.3f}' + \
-                     '\t{act_t_delta:.3f}\t{sample_time:.3f}\n').format(
-                         time = cur_time,
-                         set_t = set_temp,
-                         act_t = act_temp,
-                         act_t_avg = mean(temp_history),
-                         act_t_delta = error,
-                         sample_time = meas_time
-                     )
-                )
-                
-                yield set_temp, act_temp
-                set_temp += temp_step / 1000
-                
-            return
-
-    def get_user_data():
-        start_time = time()
-        cur_time = 0
-        
-        with open(log_file_path,
-                  mode = 'a',
-                  buffering = 1) as log_file:
-            
-            log_file.write('#time/s\t{data}\n'.format(
-                data = '\t'.join(query_cmds)))
-            
+            # wait until temperature stabilizes
+            meas_start_time = time()
+            timeout = 300            # in seconds
             while True:
-                new_data = get_data(
-                    query_cmds,
-                    known = [cur_time],
-                    log_file = log_file
-                )
                 cur_time = time() - start_time
-                yield cur_time, new_data
+                act_temp = get_data(
+                    query_cmds,
+                    known = [cur_time, set_temp]
+                )
+                if len(temp_history) >= error_samples:
+                    error = 0
+                    for prev_temp in temp_history:
+                        error += abs(act_temp - prev_temp)
+                        
+                    if error / error_samples <= max_error:
+                        break
+                        
+                    temp_history.pop(0)
+                        
+                temp_history.append(act_temp)
                 sleep(interval)
+                meas_time = time() - meas_start_time
+                if meas_time > timeout:
+                    break
+
+            log_file_resp.write(
+                ('{time:.3f}\t{set_t:.3f}\t{act_t:.3f}\t{act_t_avg:.3f}' + \
+                 '\t{act_t_delta:.3f}\t{sample_time:.3f}\n').format(
+                     time = cur_time,
+                     set_t = set_temp,
+                     act_t = act_temp,
+                     act_t_avg = mean(temp_history),
+                     act_t_delta = error,
+                     sample_time = meas_time
+                 )
+            )
+                
+            yield set_temp, act_temp
+            set_temp += temp_step / 1000
+                
+        return
     
+    # user requested data specifics, response_curve is False
+    def get_user_data():
+        if log_to_old:
+            start_time = time() - time_offset - interval
+        else:
+            start_time = time() - time_offset
+        
+        while True:
+            cur_time = time() - start_time
+            new_data = get_data(
+                query_cmds,
+                known = [cur_time]
+            )
+            yield cur_time, new_data
+            sleep(interval)
+
+    # plotting specifics
     def run(data):
         # update the data
         x, y = data
@@ -524,7 +530,10 @@ def plot(user_input, response_curve = False):
         if not run.pause:
             run.maxy = max(run.maxy, y)
             run.miny = min(run.miny, y)
-            axes.set_xlim(xdata[0], x)
+            if xdata[0] == x:
+                axes_lower.set_xlim(x, x + 0.001)
+            else:
+                axes.set_xlim(xdata[0], x)
             ymin, ymax = axes.get_ylim()
             ylim_padding_abs = ylim_padding * (ymax - ymin)
             axes.set_ylim(
@@ -536,18 +545,74 @@ def plot(user_input, response_curve = False):
         return line,
     
     ################################### INIT ##################################
+
+    # user_input[0] will be 'plot', discard it
+    status, user_dict = process_input(user_input[1:], multi_cmds = True)
+    
+    if status != 0:
+        return status
+    
+    query_cmds, addr, interval, port, log_file_path, log_dir, no_log, \
+        continue_log, temp_step, start_temp, stop_temp = [
+            user_dict[key] for key in [
+                'commands', 'address', 'interval', 'port',
+                'log_file', 'log_dir', 'no_log', 'continue_log',
+                'temp_step', 'start_temp', 'stop_temp'
+            ]
+        ]
+    
+    if len(query_cmds) == 0:
+        query_cmds = ['ACT_T', 'TE_I', 'TE_V']
+    elif response_curve and 'ACT_T' not in query_cmds:
+        query_cmds.insert(0, 'ACT_T')
+        
+    # log files
+    time_offset = 0
+    log_to_old = False
+    if no_log:
+        log_file_path = os.devnull
+        del query_cmds[1:]		# no need to send additional commands
+        
+    elif continue_log is not None:
+        log_to_old = True
+        if continue_log == 'last':
+            log, cmds = find_last_modified()
+            if log and cmds:
+                continue_log = log
+                query_cmds = cmds
+            else:
+                log_to_old = False
+                
+        log_file_path = continue_log
+        time_offset = get_last_timestamp(continue_log)
+        
+    elif log_file_path is None:
+        log_file_path = os.path.join(log_dir,
+                                     '{cmd}_unit{addr}_{time}.log'.format(
+            cmd = query_cmds[0],
+            addr = addr,
+            time = strftime('%Y-%m-%d_%H-%M-%S')))
+        
+    if response_curve and not no_log:
+        log_resp_file_path = '_response.'.join(
+            log_file_path.rsplit('.', 1))
+    else:
+        log_resp_file_path = os.devnull
+
+    soc = connect_to_socket(port)
+    
+    rcParams['toolbar'] = 'None'
     
     max_data_points = 500
     ylim_padding = 0.1    # y-limit padding in fraction of range
     xdata, ydata = [], []
     fig = pyplot.figure()
     axes = fig.add_subplot(211, axisbg = '#FFFFFF')       # full plot
-    axes_lower = fig.add_subplot(212, axisbg = '#FFFFFF') # user selection
+    axes_lower = fig.add_subplot(212, axisbg = '#FFFFFF') # zoom of user selection
     line, = axes.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
     line_lower, = axes_lower.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
     nooff_formatter = ticker.ScalarFormatter(useOffset = False)
     float_formatter = ticker.FormatStrFormatter('%.3f')
-    axes.set_title(query_cmds[0])
     for ax in (axes, axes_lower):
         ax.set_xlim(0, 1)
         if response_curve:
@@ -556,10 +621,10 @@ def plot(user_input, response_curve = False):
         else:
             ax.set_xlabel('Time / s')
             ax.xaxis.set_major_formatter(nooff_formatter)
-        ax.set_ylabel('')
+        ax.set_ylabel(query_cmds[0])
         ax.yaxis.set_major_formatter(float_formatter)
         ax.grid()
-    run.pause = False
+    run.pause = False	# pause plotting while spanning top plot
     run.maxy = None
     run.miny = None
     coords_label = pyplot.text(
@@ -593,28 +658,37 @@ def plot(user_input, response_curve = False):
             'alpha': 0.5,
             'facecolor': 'red'
         })
-
-        
+    
     if response_curve:
         new_data =  get_response
     else:
-         new_data = get_user_data
-    anim = animation.FuncAnimation(
-        fig,
-        run,
-        frames = new_data,
-        blit = False,
-        interval = 10,
-        repeat = False
-    )
+        new_data = get_user_data
+
+    with open(log_file_path,
+              mode = 'a',
+              buffering = 1) as log_file, \
+        open(log_resp_file_path,
+             mode = 'a',
+             buffering = 1) as log_file_resp:
+
+        anim = animation.FuncAnimation(
+            fig,
+            run,
+            frames = new_data,
+            init_func = init_logs,
+            blit = False,
+            interval = 10,
+            repeat = False
+        )
     
-    resize_objects()
-    fig.canvas.mpl_connect('resize_event', resize_objects)
-    fig.canvas.mpl_connect('motion_notify_event', mouse_onmove)
-    try:
-        pyplot.show()
-    except KeyboardInterrupt:
-        pass
+        resize_objects()
+        fig.canvas.mpl_connect('resize_event', resize_objects)
+        fig.canvas.mpl_connect('motion_notify_event', mouse_onmove)
+        
+        try:
+            pyplot.show()
+        except KeyboardInterrupt:
+            pass
 
     soc.close()
     return 0
@@ -737,11 +811,12 @@ def generate_cmd(cmd, val, addr):
     if cmd_type == 'write':
         # it is a write command
         cmd_type = write_char
-        for alias in cmd_vals['alias'].keys() if 'alias' in cmd_vals else []:
-            # check if it is an alias
-            if val == alias:
-                val = cmd_vals['alias'][alias]
-                break
+        if 'alias' in cmd_vals:
+            for alias in cmd_vals['alias'].keys():
+                # check if it is an alias
+                if val.upper() == alias:
+                    val = cmd_vals['alias'][alias]
+                    break
             
         else:
             # else, first check if it is in the right format
@@ -810,58 +885,60 @@ def process_input(user_input, multi_cmds = False):
     interval = opts.interval
     log_file = opts.log_file
     log_dir = opts.log_dir
+    continue_log = opts.continue_log
     no_log = opts.no_log
     temp_step = opts.temp_step
     start_temp = opts.start_temp
     stop_temp = opts.stop_temp
     
-    if port < 1:
+    if opts.port < 1:
         print('Port number must be positive!', file = sys.stderr)
         return 1, {}
 
-    if device[0] != '/':
-        device = '/dev/{tty}'.format(tty = device)
-    if not os.path.exists(device):
-        print('No such file {tty}! Aborting'.format(tty = device),
+    if opts.device[0] != '/':
+        opts.device = '/dev/{tty}'.format(tty = opts.device)
+    if not os.path.exists(opts.device):
+        print('No such file {tty}! Aborting'.format(tty = opts.device),
               file = sys.stderr)
         return 1, {}
     
-    if not min_unit_address <= address <= max_unit_address:
+    if not min_unit_address <= opts.address <= max_unit_address:
         print(('Unit address must be between {min} and {max}! ' +
                'Aborting.').format(min = min_unit_address,
                                    max = max_unit_address),
               file = sys.stderr)
         return 1, {}
-    address = '{!s:0>2}'.format(address)
+    opts.address = '{addr!s:0>2}'.format(addr = opts.address)
 
-    if interval < 0:
+    if opts.interval < 0:
         print('Check interval cannot be negative!', file = sys.stderr)
         return 1, {}
 
-    if log_dir != '':
-        if not os.path.isdir(log_dir):
-            os.mkdir(log_dir, mode = 0o755)
+    if opts.log_dir != '':
+        if not os.path.isdir(opts.log_dir):
+            os.mkdir(opts.log_dir, mode = 0o755)
 
-    if temp_step <= 0:
+    if opts.continue_log not in [None, 'last']:
+        if not os.path.isfile(opts.continue_log):
+            print('No such file: {log}'.format(
+                log = opts.continue_log), file = sys.stderr)
+            return 1, {}
+            
+    if opts.temp_step <= 0:
         print('Temperature step must be positive!', file = sys.stderr)
         return 1, {}
 
-    if stop_temp < start_temp:
-        temp_step = -temp_step
+    if opts.stop_temp < opts.start_temp:
+        opts.temp_step = -opts.temp_step
 
+    user_dict = {}
+    for key in vars(opts).keys():
+        user_dict[key] = getattr(opts, key)
+            
     if multi_cmds:
         # value is not used if multiple commands are given
-        return 0, { 'commands': [el.upper() for el in args],
-                    'port': port,
-                    'device': device,
-                    'address': address,
-                    'interval': interval,
-                    'log_file': log_file,
-                    'log_dir': log_dir,
-                    'no_log': no_log,
-                    'temp_step': temp_step,
-                    'start_temp': start_temp,
-                    'stop_temp': stop_temp }
+        user_dict['commands'] = [el.upper() for el in args]
+        
     elif len(args) > 0:
         cmd = args[0].upper()
         if 'format' not in cmds[cmd]['read']:
@@ -877,31 +954,14 @@ def process_input(user_input, multi_cmds = False):
         else:
             val = ''
 
-        return 0, { 'command': cmd,
-                    'value': val,
-                    'port': port,
-                    'device': device,
-                    'address': address,
-                    'interval': interval,
-                    'log_file': log_file,
-                    'log_dir': log_dir,
-                    'no_log': no_log,
-                    'temp_step':  temp_step,
-                    'start_temp':  start_temp,
-                    'stop_temp':  stop_temp }
+        user_dict['command'] = cmd
+        user_dict['value'] = val
+        
     else:
-        return 0, { 'command': None,
-                    'value': None,
-                    'port': port,
-                    'device': device,
-                    'address': address,
-                    'interval': interval,
-                    'log_file': log_file,
-                    'log_dir': log_dir,
-                    'no_log': no_log,
-                    'temp_step':  temp_step,
-                    'start_temp':  start_temp,
-                    'stop_temp':  stop_temp }
+        user_dict['command'] = None
+        user_dict['value'] = None
+
+    return 0, user_dict
 
 def usage():
     process_input(['--help'])
@@ -912,50 +972,53 @@ def usage():
 
 allowed_actions = {
     'start': {
-        'usage': '1* Daemon actions:\n  %prog start [--port]',
+        'usage': '1* Daemon actions:\n    %prog start [--port] [--device]',
         'callable': start,
         'num_args': None
     },
     'stop': {
-        'usage': '2  %prog stop [--port]',
+        'usage': '2    %prog stop [--port] [--device]',
         'callable': stop,
         'num_args': None
     },
     'restart': {
-        'usage': '3  %prog restart [--port]',
+        'usage': '3    %prog restart [--port] [--device]',
         'callable': restart,
         'num_args': None
     },
     'reload': {
-        'usage': '4  %prog reload [--port]',
+        'usage': '4    %prog reload [--port] [--device]',
         'callable': reload_config,
         'num_args': None
     },
     'single': {
-        'usage': '5* Send single command to device\n' + \
-            '  %prog <command> [<value>] [--port] [--address]',
+        'usage': ('5* Send single command to device:\n' + \
+                  '    %prog <command> [<value>] [--port] [--address]'),
         'callable': onetime_action,
         'num_args': None
     },
     'interact': {
-        'usage': '6* Read commands from stdin\n  %prog interact [--port]',
+        'usage': '6* Read commands from stdin:\n    %prog interact [--port]',
         'callable': interact,
         'num_args': None
     },
     'plot': {
-        'usage': '7* Plot reply from first command vs time and log time + ' + \
-            'replies for all given commands to file.\n' + \
-            '  By default it plots ACT_T and logs TE_V, TE_I as well.\n' + \
-            '  %prog plot [<command> ...] [--port] [--address] [--interval] ' + \
-            '[--log-file|--log-dir|--no-log]',
+        'usage': ('7* Plot reply from first command vs time and log time ' + \
+                  '+ replies\n  for all given commands to file.\n' + \
+                  '  By default it plots ACT_T and logs TE_V and TE_I as ' + \
+                  'well:\n    %prog plot [<command> ...] [<options>]'),
         'callable': plot_realtime,
         'num_args': None
     },
     'response': {
-        'usage': '8* Plot and log Tact vs Tset for the specified range ' + \
-            'using the specified temperature step.\n' + \
-            '  %prog response [--port] [--address] [--temp-step] ' + \
-            '[--start-temp] [--stop-temp] [--log-file|--log-dir|--no-log]',
+        'usage': ('8* Plot and log Tact vs Tset for the specified ' + \
+                  'range using the specified temperature step.\n' + \
+                  '  Also log all specified commands:\n' + \
+                  '  By default it logs time, TE_V and TE_I for all ' + \
+                  'points.\n  Irrespective of given commands it logs ' + \
+                  'average and sum of absolute deviation of T_ACT over ' + \
+                  'the\n  sample points, as well as stabilization time:\n' + \
+                  '    %prog response [<command> ...] [<options>]'),
         'callable': response_curve,
         'num_args': None
     }
@@ -1233,7 +1296,7 @@ usage_msg = ('\n{actions}\n\n' + \
                      [el[1:] for el in sorted([ allowed_actions[key]['usage'] \
                        for key in allowed_actions.keys() ])]
                  ),
-                 cmds = ', '.join(cmds.keys()))
+                 cmds = ', '.join(sorted(cmds.keys())))
 opt_parser = OptionParser(
     usage = usage_msg,
     option_list = [
@@ -1290,6 +1353,20 @@ opt_parser = OptionParser(
                             'ignored if --log-file is present.'),
                     metavar = 'DIR',
                     default = ''
+        ),
+        make_option('-c', '--continue',
+                    type = 'string',
+                    dest = 'continue_log',
+                    help = ('continue previous log: timestamp is offset ' + \
+                            'by the last timestamp in the specified file, ' + \
+                            'log commands are read from the file (those ' + \
+                            'specified on the command line are ignored), ' + \
+                            '--log-file option is also ignored; you can ' + \
+                            'give \'last\' instead of a filename, in ' + \
+                            'which case the last modified file matching ' + \
+                            'the pattern \'<log_dir>/*unit<unit_id>*.log\' ' + \
+                            'is used.'),
+                    metavar = 'FILE'
         ),
         make_option('-n', '--no-log',
                     action = 'store_true',
