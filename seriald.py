@@ -53,8 +53,10 @@ class SerialDaemon():
     Communication with the daemon is done on a port number specified during
     initialization (or anytime before start), defaulting to 57001. Data is
     decoded using the user specified encoding (default is UTF-8) and must be
-    in the following format:
-    <0-F><0-F0-F...0-F><data to be sent to device>
+    either exactly 'device', in which case the daemon will reply with the full
+    path to the device file it is communicating with (serial_context.port),
+    or it must be in the following format:
+        <0-F><0-F0-F...0-F><data to be sent to device>
     where the first byte of data always signifies how many (base 16) bytes
     following it give the the number (base 16) of bytes that are to be read
     from device after the data is sent to it. 0 bytes are read if data[0] is
@@ -231,6 +233,25 @@ class SerialDaemon():
                 logsyslog(LOG_INFO, 'Connected to {addr}'.format(
                     addr = soc_addr))
                 
+                # flush doesn't work in daemon mode for ttyS?
+                # close and reopen instead
+                device = self.serial_context.port
+                is_ttyS = True
+                try:
+                    # is it a number? Serial defaults to /dev/ttyS? if so
+                    device += 0
+                except TypeError:
+                    # not a number, assume string
+                    try:
+                        if not device.startswith('/dev/ttyS'):
+                            raise AttributeError
+                    except AttributeError:
+                        # not a string or not a ttyS? device
+                        # assume flushing works
+                        is_ttyS = False
+                else:
+                    device = '/dev/ttyS{num}'.format(num = device)
+                                
                 while True:
                     if soc.fileno() < 0:
                         logsyslog(LOG_INFO, 'Waiting for connection')
@@ -243,6 +264,13 @@ class SerialDaemon():
                     if data == '':
                         logsyslog(LOG_INFO, 'Closing connection')
                         soc.close()
+                        continue
+                    elif data == 'device':
+                        logsyslog(LOG_INFO, 'Device path requested')
+                        try:
+                            soc.sendall(device.encode(self.data_encoding))
+                        except ConnectionResetError:
+                            soc.close()
                         continue
 
                     logsyslog(LOG_INFO, 'Read from socket: {data}'.format(
@@ -267,29 +295,13 @@ class SerialDaemon():
                     # discard any input or output
                     self.serial_context.flushOutput()
                     self.serial_context.flushInput()
-                    self.serial_context.write(bytes(data, self.data_encoding))
-                    # flush doesn't work in daemon mode for ttyS?
-                    # close and reopen instead
-                    is_ttyS = True
-                    try:
-                        # is it a number? Serial defaults to /dev/ttyS? if so
-                        self.serial_context.port += 0
-                    except TypeError:
-                        # not a number, assume string
-                        try:
-                            if not self.serial_context.port.startswith(
-                                    '/dev/ttyS'):
-                                raise AttributeError
-                        except AttributeError:
-                            # not a string or not a ttyS? device
-                            # assume flushing works
-                            is_ttyS = False
-                    finally:
-                        if is_ttyS:
-                            self.serial_context.close()
-                            self.serial_context.open()
-                        else:
-                            self.serial_context.flush()
+                    self.serial_context.write(data.encode(self.data_encoding))
+                    
+                    if is_ttyS:
+                        self.serial_context.close()
+                        self.serial_context.open()
+                    else:
+                        self.serial_context.flush()
                             
                     logsyslog(LOG_INFO, ('Will read {length} bytes').format(
                         length = reply_length))

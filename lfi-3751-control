@@ -25,8 +25,9 @@
 # to do:
 # set timeout for response based on delta_set_t
 # fix checking for valid arguments
-# fix duplicate initial entries in log files
-# default values for arguments to send_cmd?
+# meaningful exit error codes
+# command description
+# print usage to pager
 
 import os
 import random
@@ -37,6 +38,7 @@ import sys
 from matplotlib import rcParams, animation, pyplot, ticker
 from matplotlib.widgets import SpanSelector, Button
 from matplotlib.transforms import Bbox
+from difflib import ndiff
 from glob import iglob
 from optparse import OptionParser, make_option
 from seriald import SerialDaemon
@@ -81,7 +83,7 @@ def start(user_input):
         name = exec_name,
         config_file_path = config_file,
         pidfile_path = pidfile.replace(
-            '<socket_port>', '{port}'.format(port = socket_port)
+            '<socket_port>', '{port!s}'.format(port = socket_port)
         ),
         socket_port = socket_port,
         data_encoding = data_encoding,
@@ -95,6 +97,7 @@ def start(user_input):
         timeout = serial_timeout
     )
     daemon.start()
+    return 0
     
 def stop(user_input):
     # user_input[0] will be 'stop', discard it
@@ -106,21 +109,64 @@ def stop(user_input):
     socket_port = user_dict['port']
     
     pid = get_pid(pidfile.replace(
-        '<socket_port>', '{port}'.format(port = socket_port))
+        '<socket_port>', '{port!s}'.format(port = socket_port))
     )
     if pid is None:
-        return
+        return 1
     
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:
         print('Could not kill process {}'.format(pid), file = sys.stderr)
+        return 1
+
+    return 0
 
 def restart(user_input):
-    stop(user_input)
+    status = stop(user_input)
+    if status != 0:
+        return status
+    
     sleep(1)	# wait for pidfile lock
-    start(user_input)
+    return start(user_input)
 
+def status(user_input):
+    # user_input[0] will be 'status', discard it
+    status, user_dict = process_input(user_input[1:])
+    
+    if status != 0:
+        usage()
+
+    instances = {}
+    pidbase = pidfile.replace('<socket_port>', '')
+    for inst_pidfile in iglob(pidfile.replace('<socket_port>', '*')):
+        pid = get_pid(inst_pidfile)
+        if pid is None:
+            # not running instance
+            continue
+
+        # extract the port number from the file name
+        inst_port = ''
+        for char in ndiff(inst_pidfile, pidbase):
+            if char[0] != ' ':
+                inst_port = inst_port + char[-1]
+        instances[inst_port] = pid
+        
+    if not instances:
+        print('No running instances.')
+        return 1
+        
+    for port, pid in instances.items():
+        socket = connect_to_socket(int(port))
+        socket.sendall('device'.encode(data_encoding))
+        device = socket.recv(1024).decode(data_encoding)
+        print(('PID {pid!s} listening on port {port} ' + \
+               'communicates with {dev}').format(
+                   pid = pid,
+                   port = port,
+                   dev = device))
+    return 0
+    
 def reload_config(user_input):
     # user_input[0] will be 'reload', discard it
     status, user_dict = process_input(user_input[1:])
@@ -134,15 +180,17 @@ def reload_config(user_input):
         '<socket_port>', '{port}'.format(port = socket_port))
     )
     if pid is None:
-        return
+        return 1
     
     try:
         os.kill(pid, signal.SIGHUP)
     except OSError:
         print('Could not send SIGHUP to process {}'.format(pid),
               file = sys.stderr)
+        return 1
+    
+    return 0
 
-# must return 0 on success
 def interact(user_input):
     def prompt_msg():
         print('Enter "command value [--address] [--port]".\nValues ' + \
@@ -199,15 +247,12 @@ def interact(user_input):
     soc.close()
     return 0
 
-# must return 0 on success
 def plot_realtime(user_input):
     return plot(user_input)
 
-# must return 0 on success
 def response_curve(user_input):
     plot(user_input, response_curve = True)
 
-# must return 0 on success
 def plot(user_input, response_curve = False):
     
     ################################### MISC ##################################
@@ -561,7 +606,7 @@ def plot(user_input, response_curve = False):
             ]
         ]
     
-    if len(query_cmds) == 0:
+    if not query_cmds:
         query_cmds = ['ACT_T', 'TE_I', 'TE_V']
     elif response_curve and 'ACT_T' not in query_cmds:
         query_cmds.insert(0, 'ACT_T')
@@ -693,7 +738,6 @@ def plot(user_input, response_curve = False):
     soc.close()
     return 0
 
-# must return 0 on success
 def onetime_action(user_input):
     status, user_dict = process_input(user_input)
     
@@ -705,7 +749,6 @@ def onetime_action(user_input):
         
     return status
     
-# must return 0 on success
 def send_cmd(cmd, val, addr, socket = None, port = socket_port, verbose = True):
     
     status, cmd_str = generate_cmd(cmd, val, addr)
@@ -725,9 +768,10 @@ def send_cmd(cmd, val, addr, socket = None, port = socket_port, verbose = True):
             socket.sendall(bytes('0{}'.format(cmd_str), data_encoding))
         else:
             # read reply_length bytes from device
-            socket.sendall(bytes('2{length:0>2X}{cmd}'.format(
+            socket.sendall('2{length:0>2X}{cmd}'.format(
                 length = reply_length,
-                cmd = cmd_str), data_encoding))
+                cmd = cmd_str
+            ).encode(data_encoding))
             try:
                 reply = socket.recv(1024).decode(data_encoding)
 #            except socket.timeout:
@@ -791,7 +835,6 @@ def generate_fcs(cmd):
         fcs = fcs^ord(char)
     return fcs
 
-# must return 0 on success
 def generate_cmd(cmd, val, addr):
     if val:
         cmd_type = 'write'
@@ -879,24 +922,16 @@ def generate_cmd(cmd, val, addr):
 def process_input(user_input, multi_cmds = False):
     opts, args = opt_parser.parse_args(user_input)
 
-    port = opts.port
-    device = opts.device
-    address = opts.address
-    interval = opts.interval
-    log_file = opts.log_file
-    log_dir = opts.log_dir
-    continue_log = opts.continue_log
-    no_log = opts.no_log
-    temp_step = opts.temp_step
-    start_temp = opts.start_temp
-    stop_temp = opts.stop_temp
-    
     if opts.port < 1:
         print('Port number must be positive!', file = sys.stderr)
         return 1, {}
-
-    if opts.device[0] != '/':
+    
+    # is it a number? Serial defaults to /dev/ttyS? if so
+    if opts.device.isdigit():
+        opts.device = '/dev/ttyS{num}'.format(num = opts.device)
+    elif opts.device[0] != '/':
         opts.device = '/dev/{tty}'.format(tty = opts.device)
+        
     if not os.path.exists(opts.device):
         print('No such file {tty}! Aborting'.format(tty = opts.device),
               file = sys.stderr)
@@ -965,6 +1000,7 @@ def process_input(user_input, multi_cmds = False):
 
 def usage():
     process_input(['--help'])
+    return 1
     
 ###############################################################################
 #################################### GLOBAL ###################################
@@ -977,7 +1013,7 @@ allowed_actions = {
         'num_args': None
     },
     'stop': {
-        'usage': '2    %prog stop [--port] [--device]',
+        'usage': '2    %prog stop [--port]',
         'callable': stop,
         'num_args': None
     },
@@ -986,24 +1022,29 @@ allowed_actions = {
         'callable': restart,
         'num_args': None
     },
+    'status': {
+        'usage': '4  Print info about running instances:\n    %prog status',
+        'callable': status,
+        'num_args': None
+    },
     'reload': {
-        'usage': '4    %prog reload [--port] [--device]',
+        'usage': '5  Reload configuration file:\n    %prog reload [--port]',
         'callable': reload_config,
         'num_args': None
     },
     'single': {
-        'usage': ('5* Send single command to device:\n' + \
+        'usage': ('6* Send single command to device:\n' + \
                   '    %prog <command> [<value>] [--port] [--address]'),
         'callable': onetime_action,
         'num_args': None
     },
     'interact': {
-        'usage': '6* Read commands from stdin:\n    %prog interact [--port]',
+        'usage': '7* Read commands from stdin:\n    %prog interact [--port]',
         'callable': interact,
         'num_args': None
     },
     'plot': {
-        'usage': ('7* Plot reply from first command vs time and log time ' + \
+        'usage': ('8* Plot reply from first command vs time and log time ' + \
                   '+ replies\n  for all given commands to file.\n' + \
                   '  By default it plots ACT_T and logs TE_V and TE_I as ' + \
                   'well:\n    %prog plot [<command> ...] [<options>]'),
@@ -1011,7 +1052,7 @@ allowed_actions = {
         'num_args': None
     },
     'response': {
-        'usage': ('8* Plot and log Tact vs Tset for the specified ' + \
+        'usage': ('9* Plot and log Tact vs Tset for the specified ' + \
                   'range using the specified temperature step.\n' + \
                   '  Also log all specified commands:\n' + \
                   '  By default it logs time, TE_V and TE_I for all ' + \
