@@ -70,8 +70,7 @@ def get_pid(pidfile_path):
         return int(pidfile.readline().strip())
     
 def start(user_input):
-    # user_input[0] will be 'start', discard it
-    status, user_dict = process_input(user_input[1:])
+    status, user_dict = process_input(user_input)
     
     if status != 0:
         usage()
@@ -100,8 +99,7 @@ def start(user_input):
     return 0
     
 def stop(user_input):
-    # user_input[0] will be 'stop', discard it
-    status, user_dict = process_input(user_input[1:])
+    status, user_dict = process_input(user_input)
     
     if status != 0:
         usage()
@@ -131,8 +129,7 @@ def restart(user_input):
     return start(user_input)
 
 def status(user_input):
-    # user_input[0] will be 'status', discard it
-    status, user_dict = process_input(user_input[1:])
+    status, user_dict = process_input(user_input)
     
     if status != 0:
         usage()
@@ -168,8 +165,7 @@ def status(user_input):
     return 0
     
 def reload_config(user_input):
-    # user_input[0] will be 'reload', discard it
-    status, user_dict = process_input(user_input[1:])
+    status, user_dict = process_input(user_input)
     
     if status != 0:
         usage()
@@ -201,8 +197,7 @@ def interact(user_input):
         print('Invalid syntax!\n')
         prompt_msg()
 
-    # user_input[0] will be 'interact', discard it
-    status, user_dict = process_input(user_input[1:])
+    status, user_dict = process_input(user_input)
     
     if status != 0:
         error_msg()
@@ -591,8 +586,7 @@ def plot(user_input, response_curve = False):
     
     ################################### INIT ##################################
 
-    # user_input[0] will be 'plot', discard it
-    status, user_dict = process_input(user_input[1:], multi_cmds = True)
+    status, user_dict = process_input(user_input, multi_cmds = True)
     
     if status != 0:
         return status
@@ -722,7 +716,7 @@ def plot(user_input, response_curve = False):
             frames = new_data,
             init_func = init_logs,
             blit = False,
-            interval = 10,
+            interval = 1000,
             repeat = False
         )
     
@@ -919,7 +913,11 @@ def generate_cmd(cmd, val, addr):
 ##################################### MISC ####################################
 ###############################################################################
 
-def process_input(user_input, multi_cmds = False):
+def process_input(args, multi_cmds = False):
+    user_input = args
+    if user_input[0] in allowed_actions.keys():
+        user_input.pop(0)
+        
     opts, args = opt_parser.parse_args(user_input)
 
     if opts.port < 1:
@@ -1009,47 +1007,39 @@ def usage():
 allowed_actions = {
     'start': {
         'usage': '1* Daemon actions:\n    %prog start [--port] [--device]',
-        'callable': start,
-        'num_args': None
+        'callable': start
     },
     'stop': {
         'usage': '2    %prog stop [--port]',
-        'callable': stop,
-        'num_args': None
+        'callable': stop
     },
     'restart': {
         'usage': '3    %prog restart [--port] [--device]',
-        'callable': restart,
-        'num_args': None
+        'callable': restart
     },
     'status': {
         'usage': '4  Print info about running instances:\n    %prog status',
-        'callable': status,
-        'num_args': None
+        'callable': status
     },
     'reload': {
         'usage': '5  Reload configuration file:\n    %prog reload [--port]',
-        'callable': reload_config,
-        'num_args': None
+        'callable': reload_config
     },
     'single': {
         'usage': ('6* Send single command to device:\n' + \
                   '    %prog <command> [<value>] [--port] [--address]'),
-        'callable': onetime_action,
-        'num_args': None
+        'callable': onetime_action
     },
     'interact': {
         'usage': '7* Read commands from stdin:\n    %prog interact [--port]',
-        'callable': interact,
-        'num_args': None
+        'callable': interact
     },
     'plot': {
         'usage': ('8* Plot reply from first command vs time and log time ' + \
                   '+ replies\n  for all given commands to file.\n' + \
                   '  By default it plots ACT_T and logs TE_V and TE_I as ' + \
                   'well:\n    %prog plot [<command> ...] [<options>]'),
-        'callable': plot_realtime,
-        'num_args': None
+        'callable': plot_realtime
     },
     'response': {
         'usage': ('9* Plot and log Tact vs Tset for the specified ' + \
@@ -1060,8 +1050,7 @@ allowed_actions = {
                   'average and sum of absolute deviation of T_ACT over ' + \
                   'the\n  sample points, as well as stabilization time:\n' + \
                   '    %prog response [<command> ...] [<options>]'),
-        'callable': response_curve,
-        'num_args': None
+        'callable': response_curve
     }
 }
 
@@ -1464,10 +1453,6 @@ if action.upper() in cmds.keys():
     action = 'single'
 
 if action not in allowed_actions.keys():
-    usage()
-
-if allowed_actions[action]['num_args'] is not None \
-   and len(sys.argv) - 2 not in allowed_actions[action]['num_args']:
     usage()
 
 status = allowed_actions[action]['callable'](sys.argv[1:])
