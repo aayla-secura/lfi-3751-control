@@ -24,10 +24,11 @@
 
 # to do:
 # set timeout for response based on delta_set_t
-# fix checking for valid arguments
-# meaningful exit error codes
-# command description
+# ? fix checking for valid arguments
+# ? meaningful exit error codes
+# ? commands description
 # print usage to pager
+# use unix sockets and name pidfiles and sockets according to unit id
 
 import os
 import random
@@ -49,14 +50,17 @@ from time import time, sleep, strftime
 exec_name = os.path.basename(__file__)
 pidfile = '/var/run/{name}_<socket_port>.pid'.format(name = exec_name)
 config_file = None
-socket_host = 'localhost'       # host to connect to
-socket_port = 57001             # port to request the daemon to listen on
-socket_timeout = 1              # timeout in seconds for socket.recv()
-data_encoding = 'utf-8'	        # encoding of data transmitted over socket
-plot_interval = 2               # seconds between data acquisition
-temp_step = 10                  # mK between data points for response curve
-start_temp = 25                 # start T in C for response curve
-stop_temp = 65                  # stop T in C for response curve
+socket_host = 'localhost'     # host to connect to
+socket_port = 57001           # port to request the daemon to listen on
+socket_timeout = 1            # timeout in seconds for socket.recv()
+data_encoding = 'utf-8'       # encoding of data transmitted over socket
+plot_interval = 2             # seconds between data acquisition
+temp_step = 10                # mK between data points for response curve
+start_temp = 25               # start T in C for response curve
+stop_temp = 65                # stop T in C for response curve
+response_samples = 10         # number of samples for temperature stabilization
+max_temp_error = 0.5          # max allowed sum of abs deviation in temperature
+response_timeout = 300        # seconds to wait for temperature stabilization
 
 ###############################################################################
 ################################ DAEMON RELATED ###############################
@@ -69,12 +73,7 @@ def get_pid(pidfile_path):
     with open(pidfile_path, 'r') as pidfile:
         return int(pidfile.readline().strip())
     
-def start(user_input):
-    status, user_dict = process_input(user_input)
-    
-    if status != 0:
-        usage()
-        
+def daemon_start(user_dict):
     socket_port = user_dict['port']
     serial_port = user_dict['device']
         
@@ -98,12 +97,7 @@ def start(user_input):
     daemon.start()
     return 0
     
-def stop(user_input):
-    status, user_dict = process_input(user_input)
-    
-    if status != 0:
-        usage()
-        
+def daemon_stop(user_dict):
     socket_port = user_dict['port']
     
     pid = get_pid(pidfile.replace(
@@ -120,20 +114,15 @@ def stop(user_input):
 
     return 0
 
-def restart(user_input):
-    status = stop(user_input)
+def daemon_restart(user_dict):
+    status = stop(user_dict)
     if status != 0:
         return status
     
     sleep(1)	# wait for pidfile lock
-    return start(user_input)
+    return start(user_dict)
 
-def status(user_input):
-    status, user_dict = process_input(user_input)
-    
-    if status != 0:
-        usage()
-
+def daemon_status(user_dict):
     instances = {}
     pidbase = pidfile.replace('<socket_port>', '')
     for inst_pidfile in iglob(pidfile.replace('<socket_port>', '*')):
@@ -156,20 +145,23 @@ def status(user_input):
     for port, pid in instances.items():
         socket = connect_to_socket(int(port))
         socket.sendall('device'.encode(data_encoding))
-        device = socket.recv(1024).decode(data_encoding)
-        print(('PID {pid!s} listening on port {port} ' + \
-               'communicates with {dev}').format(
-                   pid = pid,
-                   port = port,
-                   dev = device))
+        try:
+            device = socket.recv(1024).decode(data_encoding)
+#        except socket.timeout:
+        except:
+            print(('PID {pid!s} listening on port {port} ' + \
+                   'is busy').format(
+                       pid = pid,
+                       port = port))
+        else:
+            print(('PID {pid!s} listening on port {port} ' + \
+                   'communicates with {dev}').format(
+                       pid = pid,
+                       port = port,
+                       dev = device))
     return 0
     
-def reload_config(user_input):
-    status, user_dict = process_input(user_input)
-    
-    if status != 0:
-        usage()
-        
+def daemon_reload_config(user_dict):
     socket_port = user_dict['port']
     
     pid = get_pid(pidfile.replace(
@@ -187,68 +179,88 @@ def reload_config(user_input):
     
     return 0
 
-def interact(user_input):
+def interact(user_dict):
     def prompt_msg():
-        print('Enter "command value [--address] [--port]".\nValues ' + \
-              'are optional, their presence indicates a write command.\n' + \
-              'Address is optional, defaults to 1.\nEnter to quit.')
+        print(('Communicating with unit {address}.\nEnter "command [value]' + \
+               ' [--address] [--port]".\nValues are optional, their ' + \
+               'presence indicates a write command.\nIf you have specified' + \
+               ' an address or port number on the\ninitial command line, ' + \
+               'they will take precedence over the default values.\n\n' + \
+               'Enter on blank line to quit.').format(address = address))
 
     def error_msg():
-        print('Invalid syntax!\n')
-        prompt_msg()
+        print('Invalid syntax or device command!')
 
-    status, user_dict = process_input(user_input)
-    
-    if status != 0:
-        error_msg()
-        
+    # address and port specified on the command line take precedence
+    address = user_dict['address']
     port = user_dict['port']
+    # save the default ones for restoration later
+    tmp_address = unit_address
+    tmp_port = socket_port
+    opt_parser.set_defaults(port = port, address = address)
     
     soc = connect_to_socket(port)
     try:
         prompt_msg()
         while True:
-            new_input = input()
+            print('\n>', end = ' ')
+            try:
+                new_input = input()
+            except EOFError:
+                break
+            
             if new_input == '':
                 break
             status, user_dict = process_input(
-                new_input.split(' ')
-            )
+                new_input.split(' '))
             
             if status != 0:
                 error_msg()
+                continue
                 
-            cmd, val, port, addr = [
+            args, address, port = [
                 user_dict[key] for key in [
-                    'command',
-                    'value',
-                    'port',
-                    'address'
+                    'args',
+                    'address',
+                    'port'
                 ]
             ]
             
-            if cmd is None:
+            if not args:
                 break
             
             if port != soc.getsockname():
                 soc.close()
                 soc = connect_to_socket(port)
-                    
-            send_cmd(cmd, val, addr, socket = soc)
+                
+            command = args[0]
+            if command not in device_commands:
+                error_msg()
+                continue
+            
+            try:
+                value = args[1]
+            except IndexError:
+                value = ''
+                
+            send_cmd(command, value, address, socket = soc)
             
     except KeyboardInterrupt:
         pass
 
+    # restore original default values
+    opt_parser.set_defaults(port = tmp_port, address = tmp_address)
+
     soc.close()
     return 0
 
-def plot_realtime(user_input):
-    return plot(user_input)
+def plot_realtime(user_dict):
+    return plot(user_dict)
 
-def response_curve(user_input):
-    plot(user_input, response_curve = True)
+def response_curve(user_dict):
+    return plot(user_dict, response_curve = True)
 
-def plot(user_input, response_curve = False):
+def plot(user_dict, response_curve = False):
     
     ################################### MISC ##################################
     
@@ -260,9 +272,9 @@ def plot(user_input, response_curve = False):
         else:
             root = ''
 
-        files = iglob('{root}*unit{addr}*.log'.format(
+        files = iglob('{root}*unit{address}*.log'.format(
             root = root,
-            addr = addr))
+            address = address))
 
         try:
             last_file_path = max(files, key = os.path.getmtime)
@@ -446,10 +458,10 @@ def plot(user_input, response_curve = False):
         while True:
             data = []
             for cmd in query:
-                status, val = send_cmd(
+                status, value = send_cmd(
                     cmd,
                     '',
-                    addr,
+                    address,
                     socket = soc,
                     verbose = False
                 )
@@ -459,7 +471,7 @@ def plot(user_input, response_curve = False):
                     data.append('null')
                     continue
 
-                data.append(val)
+                data.append(value)
 
             if data[0] == 'null':
                 continue
@@ -484,29 +496,27 @@ def plot(user_input, response_curve = False):
             send_cmd(
                 'SET_T',
                 '{temp!s}'.format(temp = set_temp),
-                addr,
+                address,
                 socket = soc,
                 verbose = False
             )
             temp_history = []
-            error_samples = 10       # number of previous samples to look at
-            max_error = 0.5 / 1000   # stabilize to that temp in C (per sample)
             
             # wait until temperature stabilizes
             meas_start_time = time()
-            timeout = 300            # in seconds
+            
             while True:
                 cur_time = time() - start_time
                 act_temp = get_data(
                     query_cmds,
                     known = [cur_time, set_temp]
                 )
-                if len(temp_history) >= error_samples:
+                if len(temp_history) >= samples:
                     error = 0
                     for prev_temp in temp_history:
                         error += abs(act_temp - prev_temp)
                         
-                    if error / error_samples <= max_error:
+                    if error / samples <= max_error / 1000:
                         break
                         
                     temp_history.pop(0)
@@ -532,8 +542,6 @@ def plot(user_input, response_curve = False):
             yield set_temp, act_temp
             set_temp += temp_step / 1000
                 
-        return
-    
     # user requested data specifics, response_curve is False
     def get_user_data():
         if log_to_old:
@@ -586,19 +594,12 @@ def plot(user_input, response_curve = False):
     
     ################################### INIT ##################################
 
-    status, user_dict = process_input(user_input, multi_cmds = True)
-    
-    if status != 0:
-        return status
-    
-    query_cmds, addr, interval, port, log_file_path, log_dir, no_log, \
-        continue_log, temp_step, start_temp, stop_temp = [
-            user_dict[key] for key in [
-                'commands', 'address', 'interval', 'port',
-                'log_file', 'log_dir', 'no_log', 'continue_log',
-                'temp_step', 'start_temp', 'stop_temp'
-            ]
-        ]
+    query_cmds, address, interval, port, log_file_path, log_dir, no_log, \
+        continue_log, temp_step, start_temp, stop_temp, samples, max_error, \
+        timeout = [ user_dict[key] for key in [
+            'args', 'address', 'interval', 'port', 'log_file', 'log_dir',
+            'no_log', 'continue_log', 'temp_step', 'start_temp', 'stop_temp',
+            'samples', 'temp_error', 'timeout' ] ]
     
     if not query_cmds:
         query_cmds = ['ACT_T', 'TE_I', 'TE_V']
@@ -627,9 +628,9 @@ def plot(user_input, response_curve = False):
         
     elif log_file_path is None:
         log_file_path = os.path.join(log_dir,
-                                     '{cmd}_unit{addr}_{time}.log'.format(
+                                     '{cmd}_unit{address}_{time}.log'.format(
             cmd = query_cmds[0],
-            addr = addr,
+            address = address,
             time = strftime('%Y-%m-%d_%H-%M-%S')))
         
     if response_curve and not no_log:
@@ -732,20 +733,26 @@ def plot(user_input, response_curve = False):
     soc.close()
     return 0
 
-def onetime_action(user_input):
-    status, user_dict = process_input(user_input)
+def onetime_action(user_dict):
+    args, address, port = [
+        user_dict[key] for key in ['args', 'address', 'port']
+    ]
+
+    if not args:
+        return 1
     
-    if status == 0:
-        cmd, val, addr, port = [
-            user_dict[key] for key in ['command', 'value', 'address', 'port']
-        ]
-        status = send_cmd(cmd, val, addr, port = port)[0]
-        
-    return status
+    command = args[0]
+    try:
+        value = args[1]
+    except IndexError:
+        value = ''
+                
+    return send_cmd(command, value, address, port = port)[0]
     
-def send_cmd(cmd, val, addr, socket = None, port = socket_port, verbose = True):
+def send_cmd(cmd, value, address, socket = None,
+             port = socket_port, verbose = True):
     
-    status, cmd_str = generate_cmd(cmd, val, addr)
+    status, cmd_str = generate_cmd(cmd, value, address)
     data = None
     if status == 0:
         if socket is None:
@@ -757,7 +764,7 @@ def send_cmd(cmd, val, addr, socket = None, port = socket_port, verbose = True):
             soc_close = False
 
         # the device is to be halted (does not send a reply)
-        if 'format' not in cmds[cmd]['read']:
+        if 'format' not in device_commands[cmd]['read']:
             # 1st byte is 0 => do not read reply from device
             socket.sendall(bytes('0{}'.format(cmd_str), data_encoding))
         else:
@@ -777,16 +784,16 @@ def send_cmd(cmd, val, addr, socket = None, port = socket_port, verbose = True):
                     data = reply[first_data_char - 1 : last_data_char]
                 else:
                     # data received is partial, search for data field
-                    if val:
+                    if value:
                         cmd_type = 'write'
                     else:
                         cmd_type = 'read'
     
-                    val_regex = cmds[cmd][cmd_type]['format']
-                    val_regex = val_regex.replace('+', '[+-]')
-                    val_regex = val_regex.replace('D', '[0-9]')
-                    val_regex = val_regex.replace('A', '[a-zA-Z0-9_-]')
-                    regex_pat = regex.compile(val_regex)
+                    value_regex = device_commands[cmd][cmd_type]['format']
+                    value_regex = value_regex.replace('+', '[+-]')
+                    value_regex = value_regex.replace('D', '[0-9]')
+                    value_regex = value_regex.replace('A', '[a-zA-Z0-9_-]')
+                    regex_pat = regex.compile(value_regex)
                     matches = regex_pat.findall(reply)
                     if len(matches) == 1:
                         data = matches[0]
@@ -797,8 +804,8 @@ def send_cmd(cmd, val, addr, socket = None, port = socket_port, verbose = True):
                 elif verbose:
                     print('Device replied with: {data}'.format(
                         data = data))
-                    if 'info' in cmds[cmd]['read']:
-                        print(cmds[cmd]['read']['info'])
+                    if 'info' in device_commands[cmd]['read']:
+                        print(device_commands[cmd]['read']['info'])
                 
                     
         if soc_close:
@@ -829,17 +836,21 @@ def generate_fcs(cmd):
         fcs = fcs^ord(char)
     return fcs
 
-def generate_cmd(cmd, val, addr):
-    if val:
+def generate_cmd(cmd, value, address):
+    if cmd not in device_commands:
+        print('Invalid device command!', file = sys.stderr)
+        return 1, None
+        
+    if value:
         cmd_type = 'write'
     else:
         cmd_type = 'read'
         
-    cmd_code = cmds[cmd]['code']
-    cmd_vals = cmds[cmd][cmd_type]
+    cmd_code = device_commands[cmd]['code']
+    cmd_values = device_commands[cmd][cmd_type]
     
     # format must be defined if cmd_type is allowed for this command
-    if 'format' not in cmd_vals:
+    if 'format' not in cmd_values:
         print(('{type} is not a valid operation for command ' +
                '{cmd}').format(cmd = cmd, type = cmd_type),
               file = sys.stderr)
@@ -848,62 +859,62 @@ def generate_cmd(cmd, val, addr):
     if cmd_type == 'write':
         # it is a write command
         cmd_type = write_char
-        if 'alias' in cmd_vals:
-            for alias in cmd_vals['alias'].keys():
+        if 'alias' in cmd_values:
+            for alias in cmd_values['alias']:
                 # check if it is an alias
-                if val.upper() == alias:
-                    val = cmd_vals['alias'][alias]
+                if value.upper() == alias:
+                    value = cmd_values['alias'][alias]
                     break
             
         else:
             # else, first check if it is in the right format
-            val_regex = val_format = cmd_vals['format']
-            val_regex = val_regex.replace('+', '[+-]')
-            val_regex = val_regex.replace('D', '[0-9]')
-            val_regex = val_regex.replace('A', '[a-zA-Z0-9_-]')
-            regex_pat = regex.compile(val_regex, regex.I)
+            value_regex = value_format = cmd_values['format']
+            value_regex = value_regex.replace('+', '[+-]')
+            value_regex = value_regex.replace('D', '[0-9]')
+            value_regex = value_regex.replace('A', '[a-zA-Z0-9_-]')
+            regex_pat = regex.compile(value_regex, regex.I)
                 
-            if val_format == '+DDD.DDD':
+            if value_format == '+DDD.DDD':
                 # value should be numeric
                 # accept any valid number and convert it to the right format
-                val = '{sign}{val:0>7.3f}'.format(
-                    sign = ('+' if val[0].isdigit() or \
-                            val[0] == '.' else val[0]),
-                    val = abs(float(val)))
+                value = '{sign}{value:0>7.3f}'.format(
+                    sign = ('+' if value[0].isdigit() or \
+                            value[0] == '.' else value[0]),
+                    value = abs(float(value)))
 
-            if regex_pat.fullmatch(val) is None:
-                print(('{val} is neither a known alias nor in the ' +
+            if regex_pat.fullmatch(value) is None:
+                print(('{value} is neither a known alias nor in the ' +
                        'allowed format for command {cmd}').format(
                            cmd = cmd,
-                           val = val),
+                           value = value),
                       file = sys.stderr)
                 return 1, None
         
             # then check if it is in the allowed range
-            if 'range' in cmd_vals:
+            if 'range' in cmd_values:
                 low_limit, high_limit = [
-                    float(el) for el in cmd_vals['range'].split(' ')
+                    float(el) for el in cmd_values['range'].split(' ')
                 ]
                 
-                if not low_limit <= float(val) <= high_limit:
-                    print(('{val} is not within the allowed numerical range ' +
-                           'for command {cmd}').format(cmd = cmd, val = val),
+                if not low_limit <= float(value) <= high_limit:
+                    print(('{value} is not within the allowed numerical range ' +
+                           'for command {cmd}').format(cmd = cmd, value = value),
                           file = sys.stderr)
                     return 1, None
 
     else:
         # it is a read command
         cmd_type = read_char
-        val = cmd_vals['format'].replace('D', '0').replace('A', '0')
+        value = cmd_values['format'].replace('D', '0').replace('A', '0')
 
     # command to the device must be in the following format
-    cmd = '{char}{unit_type}{unit_addr}{cmd_type}{cmd_code}{val}'.format(
+    cmd = '{char}{unit_type}{unit_address}{cmd_type}{cmd_code}{value}'.format(
         char = cmd_char,
         unit_type = unit_type,
-        unit_addr = addr,
+        unit_address = address,
         cmd_type = cmd_type,
         cmd_code = cmd_code,
-        val = val
+        value = value
     )
     # append the FCS
     cmd = '{cmd}{fcs:0>2X}'.format(cmd = cmd, fcs = generate_fcs(cmd))
@@ -913,12 +924,13 @@ def generate_cmd(cmd, val, addr):
 ##################################### MISC ####################################
 ###############################################################################
 
-def process_input(args, multi_cmds = False):
-    user_input = args
-    if user_input[0] in allowed_actions.keys():
-        user_input.pop(0)
-        
+def process_input(user_input, discard_action = False):
     opts, args = opt_parser.parse_args(user_input)
+
+    # remove action, e.g. plot
+    action = None
+    if args[0] in allowed_actions:
+        action = args.pop(0)
 
     if opts.port < 1:
         print('Port number must be positive!', file = sys.stderr)
@@ -931,28 +943,28 @@ def process_input(args, multi_cmds = False):
         opts.device = '/dev/{tty}'.format(tty = opts.device)
         
     if not os.path.exists(opts.device):
-        print('No such file {tty}! Aborting'.format(tty = opts.device),
+        print('No such file {tty}!'.format(tty = opts.device),
               file = sys.stderr)
         return 1, {}
     
     if not min_unit_address <= opts.address <= max_unit_address:
-        print(('Unit address must be between {min} and {max}! ' +
-               'Aborting.').format(min = min_unit_address,
+        print(('Unit address must be between {min} and ' +
+               '{max}!').format(min = min_unit_address,
                                    max = max_unit_address),
               file = sys.stderr)
         return 1, {}
-    opts.address = '{addr!s:0>2}'.format(addr = opts.address)
+    opts.address = '{address!s:0>2}'.format(address = opts.address)
 
     if opts.interval < 0:
         print('Check interval cannot be negative!', file = sys.stderr)
         return 1, {}
 
-    if opts.log_dir != '':
-        if not os.path.isdir(opts.log_dir):
+    if opts.log_dir != '' \
+       and not os.path.isdir(opts.log_dir):
             os.mkdir(opts.log_dir, mode = 0o755)
 
-    if opts.continue_log not in [None, 'last']:
-        if not os.path.isfile(opts.continue_log):
+    if opts.continue_log not in [None, 'last'] \
+       and not os.path.isfile(opts.continue_log):
             print('No such file: {log}'.format(
                 log = opts.continue_log), file = sys.stderr)
             return 1, {}
@@ -964,41 +976,30 @@ def process_input(args, multi_cmds = False):
     if opts.stop_temp < opts.start_temp:
         opts.temp_step = -opts.temp_step
 
+    if opts.samples <= 0:
+        print('Response samples must be positive!', file = sys.stderr)
+        return 1, {}
+
+    if opts.temp_error < 0:
+        print('Temperature error cannot be negative!', file = sys.stderr)
+        return 1, {}
+
+    if opts.timeout <= opts.interval * opts.samples:
+        print('Response timeout must be larger than samples * interval!', file = sys.stderr)
+        return 1, {}
+
     user_dict = {}
-    for key in vars(opts).keys():
+    for key in vars(opts):
         user_dict[key] = getattr(opts, key)
-            
-    if multi_cmds:
-        # value is not used if multiple commands are given
-        user_dict['commands'] = [el.upper() for el in args]
-        
-    elif len(args) > 0:
-        cmd = args[0].upper()
-        if 'format' not in cmds[cmd]['read']:
-            # user does not provide value for this operation
-            # but operation is still 'write'
-            args.insert(1, '+000.000')
 
-        if not 1 <= len(args) <= 2:
-            usage()
-
-        if len(args) == 2:
-            val = args[1]
-        else:
-            val = ''
-
-        user_dict['command'] = cmd
-        user_dict['value'] = val
-        
-    else:
-        user_dict['command'] = None
-        user_dict['value'] = None
+    user_dict['args'] = [ el.upper() for el in args ]
+    if action and not discard_action:
+        user_dict['args'].insert(0, action)
 
     return 0, user_dict
 
 def usage():
     process_input(['--help'])
-    return 1
     
 ###############################################################################
 #################################### GLOBAL ###################################
@@ -1007,23 +1008,23 @@ def usage():
 allowed_actions = {
     'start': {
         'usage': '1* Daemon actions:\n    %prog start [--port] [--device]',
-        'callable': start
+        'callable': daemon_start
     },
     'stop': {
         'usage': '2    %prog stop [--port]',
-        'callable': stop
+        'callable': daemon_stop
     },
     'restart': {
         'usage': '3    %prog restart [--port] [--device]',
-        'callable': restart
+        'callable': daemon_restart
     },
     'status': {
         'usage': '4  Print info about running instances:\n    %prog status',
-        'callable': status
+        'callable': daemon_status
     },
     'reload': {
         'usage': '5  Reload configuration file:\n    %prog reload [--port]',
-        'callable': reload_config
+        'callable': daemon_reload_config
     },
     'single': {
         'usage': ('6* Send single command to device:\n' + \
@@ -1031,7 +1032,8 @@ allowed_actions = {
         'callable': onetime_action
     },
     'interact': {
-        'usage': '7* Read commands from stdin:\n    %prog interact [--port]',
+        'usage': ('7* Read commands from stdin:\n' + \
+                  '    %prog interact [--address] [--port]'),
         'callable': interact
     },
     'plot': {
@@ -1066,7 +1068,7 @@ serial_timeout = 0.5
 unit_type = '1'	                # must be 1 - signifies temperature controller
 unit_address = 1                # default unit address
 min_unit_address = 1
-max_unit_address = 2
+max_unit_address = 3
 cmd_char = '!'	                # commands to the device must start with !
 cmd_length = 15	                # and must be 15 bytes long excluding FCS
 reply_length = 21               # device sends 21 bytes of data
@@ -1077,7 +1079,7 @@ read_char = '1'	                # 1 for read commands, 2 for write commands
 write_char = '2'
 temp_lims = '-199.900 +199.900'	# temperature limits
 res_lims = '+000.000 +499.900'	# resistance limits
-cmds = {
+device_commands = {
     'ACT_T': {
 	'code': '01',
 	'read': {
@@ -1279,6 +1281,7 @@ cmds = {
 	    'format': '+DDD.DDD',
             'info': """Format is: +0<AE><AS>.<TL><IS><OS>:
             AE: Autotune Error Codes:
+            	0: No error
             	1: Zero value current limit error
             	2: Current limit cannot reach SET T
             	3: Non-uniform TE I step measured
@@ -1324,9 +1327,9 @@ usage_msg = ('\n{actions}\n\n' + \
              'Available commands (case-insensitive):\n{cmds}').format(
                  actions = '\n'.join(
                      [el[1:] for el in sorted([ allowed_actions[key]['usage'] \
-                       for key in allowed_actions.keys() ])]
+                       for key in allowed_actions ])]
                  ),
-                 cmds = ', '.join(sorted(cmds.keys())))
+                 cmds = ', '.join(sorted(device_commands)))
 opt_parser = OptionParser(
     usage = usage_msg,
     option_list = [
@@ -1431,6 +1434,37 @@ opt_parser = OptionParser(
                                 default = stop_temp),
                     metavar = 'TEMP',
                     default = stop_temp
+                ),
+        make_option('-N', '--samples',
+                    type = 'int',
+                    dest = 'samples',
+                    help = ('number of data points used to determine if ' + \
+                            'temperature is stable; ' + \
+                            'default is {default}.').format(
+                                default = response_samples),
+                    metavar = 'NUMBER',
+                    default = response_samples
+        ),
+        make_option('-e', '--temp-error',
+                    type = 'float',
+                    dest = 'temp_error',
+                    help = ('maximum (sum of absolute) temperature ' + \
+                            'deviation in mK over the samples; ' + \
+                            'default is {default}.').format(
+                                default = max_temp_error),
+                    metavar = 'TEMP',
+                    default = max_temp_error
+        ),
+        make_option('-T', '--timeout',
+                    type = 'int',
+                    dest = 'timeout',
+                    help = ('if the temperature does not stabilize to the ' + \
+                            'desired level within that many seconds, the ' + \
+                            'measurement for that point terminates anyway ' + \
+                            'default is {default}.').format(
+                                default = response_timeout),
+                    metavar = 'SECONDS',
+                    default = response_timeout
         )
     ]
 )
@@ -1447,15 +1481,19 @@ if os.geteuid() != 0:
 if len(sys.argv) < 2:
     usage()
 
-action = sys.argv[1]
-
-if action.upper() in cmds.keys():
+status, user_dict = process_input(sys.argv[1:])
+if status != 0:
+    sys.exit(status)
+    
+action = None
+if user_dict['args'][0] in allowed_actions:
+    action = user_dict['args'].pop(0)
+elif user_dict['args'][0] in device_commands:
     action = 'single'
-
-if action not in allowed_actions.keys():
+else:
     usage()
 
-status = allowed_actions[action]['callable'](sys.argv[1:])
+status = allowed_actions[action]['callable'](user_dict)
 if status is None:
     status = 0
 sys.exit(status)
