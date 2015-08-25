@@ -54,6 +54,7 @@ socket_host = 'localhost'     # host to connect to
 socket_port = 57001           # port to request the daemon to listen on
 socket_timeout = 1            # timeout in seconds for socket.recv()
 data_encoding = 'utf-8'       # encoding of data transmitted over socket
+
 plot_interval = 2             # seconds between data acquisition
 temp_step = 10                # mK between data points for response curve
 start_temp = 25               # start T in C for response curve
@@ -143,12 +144,11 @@ def daemon_status(user_dict):
         return 1
         
     for port, pid in instances.items():
-        socket = connect_to_socket(int(port))
-        socket.sendall('device'.encode(data_encoding))
+        soc = connect_to_socket(int(port))
+        soc.sendall('device'.encode(data_encoding))
         try:
-            device = socket.recv(1024).decode(data_encoding)
-#        except socket.timeout:
-        except:
+            device = soc.recv(1024).decode(data_encoding)
+        except socket.timeout:
             print(('PID {pid!s} listening on port {port} ' + \
                    'is busy').format(
                        pid = pid,
@@ -243,7 +243,7 @@ def interact(user_dict):
             except IndexError:
                 value = ''
                 
-            send_cmd(command, value, address, socket = soc)
+            send_cmd(command, value, address, soc = soc)
             
     except KeyboardInterrupt:
         pass
@@ -462,7 +462,7 @@ def plot(user_dict, response_curve = False):
                     cmd,
                     '',
                     address,
-                    socket = soc,
+                    soc = soc,
                     verbose = False
                 )
 
@@ -497,7 +497,7 @@ def plot(user_dict, response_curve = False):
                 'SET_T',
                 '{temp!s}'.format(temp = set_temp),
                 address,
-                socket = soc,
+                soc = soc,
                 verbose = False
             )
             temp_history = []
@@ -749,15 +749,15 @@ def onetime_action(user_dict):
                 
     return send_cmd(command, value, address, port = port)[0]
     
-def send_cmd(cmd, value, address, socket = None,
+def send_cmd(cmd, value, address, soc = None,
              port = socket_port, verbose = True):
     
     status, cmd_str = generate_cmd(cmd, value, address)
     data = None
     if status == 0:
-        if socket is None:
+        if soc is None:
             # one-time command mode
-            socket = connect_to_socket(port)
+            soc = connect_to_socket(port)
             soc_close = True
         else:
             # continuous command mode
@@ -766,17 +766,16 @@ def send_cmd(cmd, value, address, socket = None,
         # the device is to be halted (does not send a reply)
         if 'format' not in device_commands[cmd]['read']:
             # 1st byte is 0 => do not read reply from device
-            socket.sendall(bytes('0{}'.format(cmd_str), data_encoding))
+            soc.sendall(bytes('0{}'.format(cmd_str), data_encoding))
         else:
             # read reply_length bytes from device
-            socket.sendall('2{length:0>2X}{cmd}'.format(
+            soc.sendall('2{length:0>2X}{cmd}'.format(
                 length = reply_length,
                 cmd = cmd_str
             ).encode(data_encoding))
             try:
-                reply = socket.recv(1024).decode(data_encoding)
-#            except socket.timeout:
-            except:
+                reply = soc.recv(1024).decode(data_encoding)
+            except socket.timeout:
                 status = 2
             else:
                 if len(reply) == reply_length:
@@ -809,7 +808,7 @@ def send_cmd(cmd, value, address, socket = None,
                 
                     
         if soc_close:
-            socket.close()
+            soc.close()
 
     return status, data
 
