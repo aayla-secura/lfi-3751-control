@@ -28,7 +28,6 @@
 # ? meaningful exit error codes
 # ? commands description
 # print usage to pager
-# use unix sockets and name pidfiles and sockets according to unit id
 
 import os
 import random
@@ -47,11 +46,14 @@ from serial import Serial, EIGHTBITS, PARITY_NONE, STOPBITS_ONE
 from statistics import mean
 from time import time, sleep, strftime
 
+###############################################################################
+#################################### GLOBAL ###################################
+###############################################################################
+
 exec_name = os.path.basename(__file__)
-pidfile = '/var/run/{name}_<socket_port>.pid'.format(name = exec_name)
 config_file = None
-socket_host = 'localhost'     # host to connect to
-socket_port = 57001           # port to request the daemon to listen on
+pidfile = '/var/run/{name}_<id>.pid'.format(name = exec_name)
+ud_socket = '/var/run/{name}_<id>.socket'.format(name = exec_name)
 socket_timeout = 1            # timeout in seconds for socket.recv()
 data_encoding = 'utf-8'       # encoding of data transmitted over socket
 
@@ -63,999 +65,6 @@ response_samples = 10         # number of samples for temperature stabilization
 max_temp_error = 0.5          # max allowed sum of abs deviation in temperature
 response_timeout = 300        # seconds to wait for temperature stabilization
 
-###############################################################################
-################################ DAEMON RELATED ###############################
-###############################################################################
-
-def get_pid(pidfile_path):
-    if not os.path.exists(pidfile_path):
-        return None
-    
-    with open(pidfile_path, 'r') as pidfile:
-        return int(pidfile.readline().strip())
-    
-def daemon_start(user_dict):
-    socket_port = user_dict['port']
-    serial_port = user_dict['device']
-        
-    daemon = SerialDaemon(
-        name = exec_name,
-        config_file_path = config_file,
-        pidfile_path = pidfile.replace(
-            '<socket_port>', '{port!s}'.format(port = socket_port)
-        ),
-        socket_port = socket_port,
-        data_encoding = data_encoding,
-        reply_length_strict = discard_invalid,
-        port = serial_port,
-        baudrate = baudrate,
-        bytesize = bytesize,
-        parity = parity,
-        stopbits = stopbits,
-        xonxoff = xonxoff,
-        timeout = serial_timeout
-    )
-    daemon.start()
-    return 0
-    
-def daemon_stop(user_dict):
-    socket_port = user_dict['port']
-    
-    pid = get_pid(pidfile.replace(
-        '<socket_port>', '{port!s}'.format(port = socket_port))
-    )
-    if pid is None:
-        return 1
-    
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        print('Could not kill process {}'.format(pid), file = sys.stderr)
-        return 1
-
-    return 0
-
-def daemon_restart(user_dict):
-    status = stop(user_dict)
-    if status != 0:
-        return status
-    
-    sleep(1)	# wait for pidfile lock
-    return start(user_dict)
-
-def daemon_status(user_dict):
-    instances = {}
-    pidbase = pidfile.replace('<socket_port>', '')
-    for inst_pidfile in iglob(pidfile.replace('<socket_port>', '*')):
-        pid = get_pid(inst_pidfile)
-        if pid is None:
-            # not running instance
-            continue
-
-        # extract the port number from the file name
-        inst_port = ''
-        for char in ndiff(inst_pidfile, pidbase):
-            if char[0] != ' ':
-                inst_port = inst_port + char[-1]
-        instances[inst_port] = pid
-        
-    if not instances:
-        print('No running instances.')
-        return 1
-        
-    for port, pid in instances.items():
-        soc = connect_to_socket(int(port))
-        soc.sendall('device'.encode(data_encoding))
-        try:
-            device = soc.recv(1024).decode(data_encoding)
-        except socket.timeout:
-            print(('PID {pid!s} listening on port {port} ' + \
-                   'is busy').format(
-                       pid = pid,
-                       port = port))
-        else:
-            print(('PID {pid!s} listening on port {port} ' + \
-                   'communicates with {dev}').format(
-                       pid = pid,
-                       port = port,
-                       dev = device))
-    return 0
-    
-def daemon_reload_config(user_dict):
-    socket_port = user_dict['port']
-    
-    pid = get_pid(pidfile.replace(
-        '<socket_port>', '{port}'.format(port = socket_port))
-    )
-    if pid is None:
-        return 1
-    
-    try:
-        os.kill(pid, signal.SIGHUP)
-    except OSError:
-        print('Could not send SIGHUP to process {}'.format(pid),
-              file = sys.stderr)
-        return 1
-    
-    return 0
-
-def interact(user_dict):
-    def prompt_msg():
-        print(('Communicating with unit {address}.\nEnter "command [value]' + \
-               ' [--address] [--port]".\nValues are optional, their ' + \
-               'presence indicates a write command.\nIf you have specified' + \
-               ' an address or port number on the\ninitial command line, ' + \
-               'they will take precedence over the default values.\n\n' + \
-               'Enter on blank line to quit.').format(address = address))
-
-    def error_msg():
-        print('Invalid syntax or device command!')
-
-    # address and port specified on the command line take precedence
-    address = user_dict['address']
-    port = user_dict['port']
-    # save the default ones for restoration later
-    tmp_address = unit_address
-    tmp_port = socket_port
-    opt_parser.set_defaults(port = port, address = address)
-    
-    soc = connect_to_socket(port)
-    try:
-        prompt_msg()
-        while True:
-            print('\n>', end = ' ')
-            try:
-                new_input = input()
-            except EOFError:
-                break
-            
-            if new_input == '':
-                break
-            status, user_dict = process_input(
-                new_input.split(' '))
-            
-            if status != 0:
-                error_msg()
-                continue
-                
-            args, address, port = [
-                user_dict[key] for key in [
-                    'args',
-                    'address',
-                    'port'
-                ]
-            ]
-            
-            if not args:
-                break
-            
-            if port != soc.getsockname():
-                soc.close()
-                soc = connect_to_socket(port)
-                
-            command = args[0]
-            if command not in device_commands:
-                error_msg()
-                continue
-            
-            try:
-                value = args[1]
-            except IndexError:
-                value = ''
-                
-            send_cmd(command, value, address, soc = soc)
-            
-    except KeyboardInterrupt:
-        pass
-
-    # restore original default values
-    opt_parser.set_defaults(port = tmp_port, address = tmp_address)
-
-    soc.close()
-    return 0
-
-def plot_realtime(user_dict):
-    return plot(user_dict)
-
-def response_curve(user_dict):
-    return plot(user_dict, response_curve = True)
-
-def plot(user_dict, response_curve = False):
-    
-    ################################### MISC ##################################
-    
-    # find the last modified log file for this unit
-    # this assumes the filename contains 'unit<id> and ends with .log'
-    def find_last_modified():
-        if log_dir:
-            root = '{root}/'.format(root = log_dir)
-        else:
-            root = ''
-
-        files = iglob('{root}*unit{address}*.log'.format(
-            root = root,
-            address = address))
-
-        try:
-            last_file_path = max(files, key = os.path.getmtime)
-        except ValueError:
-            # no matching files
-            return None, []
-
-        with open(last_file_path, mode = 'r') as last_file:
-            headline = last_file.readline()[1:]
-
-        cmds = [cmd for cmd in headline.split()
-                if cmd not in ['time/s', 'SET_T']]
-
-        return last_file_path, cmds
-        
-    # read in time of last data point from the log we're appending to
-    def get_last_timestamp(log_path, time_field = 0):
-        with open(log_path, mode = 'rb') as log_file:
-            # jump to the second last byte and look backwards for newline
-            log_file.seek(-2, os.SEEK_END)
-            while log_file.read(1) != b'\n':
-                log_file.seek(-2, os.SEEK_CUR)
-            return float(log_file.readline().split()[time_field])
-            
-    
-    # find positions of items in the sorted array U item[i]
-    # ala numpy's searchsorted
-    # both arguments must support subscripting and all items must be numeric
-    def searchsorted(array, items):
-        try:
-            items[0]
-        except TypeError:
-            items  = [ items ]
-            
-        # default position is at the end of array
-        items_indices = [len(array)] * len(items)
-        for array_id, array_el in enumerate(array):
-            for item_id, item in enumerate(items):
-                if array_el >= item and items_indices[item_id] == len(array):
-                    # found a position inside array for item j
-                    items_indices[item_id] = array_id
-    
-        return items_indices
-    
-    ############################ BUTTON AND EVENTS ############################
-    
-    # mouse was moved
-    def mouse_onmove(event):
-        if event.xdata is None:
-            return
-        
-        coords_label.set_text('x = {x:.3f}, y = {y:.3f}'.format(
-            x = event.xdata,
-            y = event.ydata
-        ))
-    
-    # span selection completed
-    def span_onselect(xmin, xmax):
-        run.pause = False
-        imin, imax = searchsorted(xdata, (xmin, xmax))
-        imax = min(len(xdata) - 1, imax)
-        imin = min(len(xdata) - 1, imin)
-    
-        if imin == imax:
-            return
-        
-        ymin, ymax = axes.get_ylim()
-        ylim_padding_abs = ylim_padding * (ymax - ymin)
-        thisx = xdata[imin:imax]
-        thisy = ydata[imin:imax]
-        line_lower.set_data(thisx, thisy)
-        axes_lower.set_xlim(thisx[0], thisx[-1])
-        axes_lower.set_ylim(
-            min(thisy) - ylim_padding_abs,
-            max(thisy) + ylim_padding_abs
-        )
-    
-    # mouse was movied while span selection was active
-    def span_onmove(xmin, xmax):
-        run.pause = True
-    
-    # clear both graphs
-    def clear_graphs(event):
-        del xdata[:]
-        del ydata[:]
-        run.miny, run.maxy = None, None
-        line.set_data(xdata, ydata)
-        line_lower.set_data(xdata, ydata)
-        pyplot.draw()
-    
-    # save figure to file
-    def save_image(event):
-        axes_extent = axes.get_window_extent().transformed(
-            fig.dpi_scale_trans.inverted())
-        axes_lower_extent = axes_lower.get_window_extent().transformed(
-            fig.dpi_scale_trans.inverted())
-        fig_width, fig_height = fig.get_size_inches()
-        vpadding = 0.5    # in inches
-        fig.savefig(
-            '{cmd}_full_range_{time}.png'.format(
-                cmd = query_cmds[0],
-                time = strftime('%Y-%m-%d_%H-%M-%S')),
-            bbox_inches = Bbox.from_bounds(
-                0,
-                axes_extent.bounds[1] - vpadding,
-                fig_width,
-                axes_extent.bounds[3] + 2 * vpadding)) # include title
-        fig.savefig(
-            '{cmd}_zoomed_range_{time}.png'.format(
-                cmd = query_cmds[0],
-                time = strftime('%Y-%m-%d_%H-%M-%S')),
-            bbox_inches = Bbox.from_bounds(
-                0,
-                axes_lower_extent.bounds[1] - vpadding,
-                fig_width,
-                axes_lower_extent.bounds[3] + 1.2 * vpadding))
-    
-    # window was resized
-    def resize_objects(event = None):
-        # in pixels
-        toolbar_hpos = 20
-        toolbar_vpos = 10
-        button_width = 40
-        button_height = 25
-        button_padding = 20
-        coords_label_width = 150
-        
-        left_margin = 80
-        right_margin = 30
-        top_margin = 20
-        bottom_margin = 80
-        plot_padding = 140
-        fig_width, fig_height = fig.canvas.get_width_height()
-        
-        # convert to fractions
-        pyplot.subplots_adjust(
-            left = left_margin / fig_width,
-            bottom = bottom_margin / fig_height,
-            right = 1 - right_margin / fig_width,
-            top = 1 - top_margin / fig_height,
-            wspace = 0,
-            hspace = plot_padding / fig_height
-        )
-        button_clear.ax.set_position([
-            toolbar_hpos / fig_width,
-            toolbar_vpos / fig_height,
-            button_width / fig_width,
-            button_height / fig_height
-        ])
-        button_save.ax.set_position([
-            (toolbar_hpos + button_width + button_padding ) / fig_width,
-            toolbar_vpos / fig_height,
-            button_width / fig_width,
-            button_height / fig_height
-        ])
-        coords_label.axes.set_position([
-            1 - (coords_label_width + right_margin) / fig_width,
-            toolbar_vpos / fig_height,
-            coords_label_width / fig_width,
-            button_height / fig_height
-        ])
-    
-    ################################### DATA ##################################
-
-    # write headline to log files
-    def init_logs():
-        if log_to_old:
-            return
-        
-        if response_curve:
-            log_file.write('#time/s\tSET_T\t{data}\n'.format(
-                data = '\t'.join(query_cmds)))
-            log_file_resp.write('#time/s\tSET_T\tACT_T\tact_t_avg' + \
-                                '\tact_t_delta\tsample_time\n')
-        else:
-            log_file.write('#time/s\t{data}\n'.format(
-                data = '\t'.join(query_cmds)))
-
-    # get requested data
-    def get_data(query, known = []):
-        while True:
-            data = []
-            for cmd in query:
-                status, value = send_cmd(
-                    cmd,
-                    '',
-                    address,
-                    soc = soc,
-                    verbose = False
-                )
-
-                if status == 2:
-                    # reading reply from device did not succeed, ignore
-                    data.append('null')
-                    continue
-
-                data.append(value)
-
-            if data[0] == 'null':
-                continue
-
-            known = ['{:.3f}'.format(el) for el in known]
-            log_file.write('{known}\t{data}\n'.format(
-                known = '\t'.join(known),
-                data = '\t'.join(data)))
-
-            return float(data[0])
-
-    # response curve data specifics, response_curve is True
-    def get_response():
-        set_temp = start_temp
-        if log_to_old:
-            start_time = time() - time_offset - interval
-        else:
-            start_time = time() - time_offset
-        
-        while (temp_step > 0 and set_temp <= stop_temp) \
-              or (temp_step < 0 and set_temp >= stop_temp):
-            send_cmd(
-                'SET_T',
-                '{temp!s}'.format(temp = set_temp),
-                address,
-                soc = soc,
-                verbose = False
-            )
-            temp_history = []
-            
-            # wait until temperature stabilizes
-            meas_start_time = time()
-            
-            while True:
-                cur_time = time() - start_time
-                act_temp = get_data(
-                    query_cmds,
-                    known = [cur_time, set_temp]
-                )
-                if len(temp_history) >= samples:
-                    error = 0
-                    for prev_temp in temp_history:
-                        error += abs(act_temp - prev_temp)
-                        
-                    if error / samples <= max_error / 1000:
-                        break
-                        
-                    temp_history.pop(0)
-                        
-                temp_history.append(act_temp)
-                sleep(interval)
-                meas_time = time() - meas_start_time
-                if meas_time > timeout:
-                    break
-
-            log_file_resp.write(
-                ('{time:.3f}\t{set_t:.3f}\t{act_t:.3f}\t{act_t_avg:.3f}' + \
-                 '\t{act_t_delta:.3f}\t{sample_time:.3f}\n').format(
-                     time = cur_time,
-                     set_t = set_temp,
-                     act_t = act_temp,
-                     act_t_avg = mean(temp_history),
-                     act_t_delta = error,
-                     sample_time = meas_time
-                 )
-            )
-                
-            yield set_temp, act_temp
-            set_temp += temp_step / 1000
-                
-    # user requested data specifics, response_curve is False
-    def get_user_data():
-        if log_to_old:
-            start_time = time() - time_offset - interval
-        else:
-            start_time = time() - time_offset
-        
-        while True:
-            cur_time = time() - start_time
-            new_data = get_data(
-                query_cmds,
-                known = [cur_time]
-            )
-            yield cur_time, new_data
-            sleep(interval)
-
-    # plotting specifics
-    def run(data):
-        # update the data
-        x, y = data
-        if None in (run.maxy, run.miny):
-            run.miny = run.maxy = y
-            
-        xdata.append(x)
-        ydata.append(y)
-        if len(xdata) > max_data_points:
-            xdata.pop(0)
-            ypop = ydata.pop(0)
-            if ypop == run.maxy:
-                run.maxy = max(ydata)
-            elif ypop == run.miny:
-                run.miny = min(ydata)
-            
-        if not run.pause:
-            run.maxy = max(run.maxy, y)
-            run.miny = min(run.miny, y)
-            if xdata[0] == x:
-                axes_lower.set_xlim(x, x + 0.001)
-            else:
-                axes.set_xlim(xdata[0], x)
-            ymin, ymax = axes.get_ylim()
-            ylim_padding_abs = ylim_padding * (ymax - ymin)
-            axes.set_ylim(
-                run.miny - ylim_padding_abs,
-                run.maxy + ylim_padding_abs
-            )
-            line.set_data(xdata, ydata)
-    
-        return line,
-    
-    ################################### INIT ##################################
-
-    query_cmds, address, interval, port, log_file_path, log_dir, no_log, \
-        continue_log, temp_step, start_temp, stop_temp, samples, max_error, \
-        timeout = [ user_dict[key] for key in [
-            'args', 'address', 'interval', 'port', 'log_file', 'log_dir',
-            'no_log', 'continue_log', 'temp_step', 'start_temp', 'stop_temp',
-            'samples', 'temp_error', 'timeout' ] ]
-    
-    if not query_cmds:
-        query_cmds = ['ACT_T', 'TE_I', 'TE_V']
-    elif response_curve and 'ACT_T' not in query_cmds:
-        query_cmds.insert(0, 'ACT_T')
-        
-    # log files
-    time_offset = 0
-    log_to_old = False
-    if no_log:
-        log_file_path = os.devnull
-        del query_cmds[1:]		# no need to send additional commands
-        
-    elif continue_log is not None:
-        log_to_old = True
-        if continue_log == 'last':
-            log, cmds = find_last_modified()
-            if log and cmds:
-                continue_log = log
-                query_cmds = cmds
-            else:
-                log_to_old = False
-                
-        log_file_path = continue_log
-        time_offset = get_last_timestamp(continue_log)
-        
-    elif log_file_path is None:
-        log_file_path = os.path.join(log_dir,
-                                     '{cmd}_unit{address}_{time}.log'.format(
-            cmd = query_cmds[0],
-            address = address,
-            time = strftime('%Y-%m-%d_%H-%M-%S')))
-        
-    if response_curve and not no_log:
-        log_resp_file_path = '_response.'.join(
-            log_file_path.rsplit('.', 1))
-    else:
-        log_resp_file_path = os.devnull
-
-    soc = connect_to_socket(port)
-    
-    rcParams['toolbar'] = 'None'
-    
-    max_data_points = 500
-    ylim_padding = 0.1    # y-limit padding in fraction of range
-    xdata, ydata = [], []
-    fig = pyplot.figure()
-    axes = fig.add_subplot(211, axisbg = '#FFFFFF')       # full plot
-    axes_lower = fig.add_subplot(212, axisbg = '#FFFFFF') # zoom of user selection
-    line, = axes.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
-    line_lower, = axes_lower.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
-    nooff_formatter = ticker.ScalarFormatter(useOffset = False)
-    float_formatter = ticker.FormatStrFormatter('%.3f')
-    for ax in (axes, axes_lower):
-        ax.set_xlim(0, 1)
-        if response_curve:
-            ax.set_xlabel('SET_T / C')
-            ax.xaxis.set_major_formatter(float_formatter)
-        else:
-            ax.set_xlabel('Time / s')
-            ax.xaxis.set_major_formatter(nooff_formatter)
-        ax.set_ylabel(query_cmds[0])
-        ax.yaxis.set_major_formatter(float_formatter)
-        ax.grid()
-    run.pause = False	# pause plotting while spanning top plot
-    run.maxy = None
-    run.miny = None
-    coords_label = pyplot.text(
-        0,
-        0,
-        'x = {x:.3f}, y = {y:.3f}'.format(
-            x = 0,
-            y = 0
-        ),
-        transform = pyplot.axes([0, 0, 0, 0.2]).transAxes
-    )
-    coords_label.axes.set_axis_off()
-    
-    button_clear = Button(
-        pyplot.axes([0, 0, 0, 0]),
-        'Clear'
-    )
-    button_clear.on_clicked(clear_graphs)
-    button_save = Button(
-        pyplot.axes([0, 0, 0, 0.1]),
-        'Save'
-    )
-    button_save.on_clicked(save_image)
-    
-    span = SpanSelector(
-        axes,
-        span_onselect,
-        'horizontal',
-        onmove_callback = span_onmove,
-        rectprops = {
-            'alpha': 0.5,
-            'facecolor': 'red'
-        })
-    
-    if response_curve:
-        new_data =  get_response
-    else:
-        new_data = get_user_data
-
-    with open(log_file_path,
-              mode = 'a',
-              buffering = 1) as log_file, \
-        open(log_resp_file_path,
-             mode = 'a',
-             buffering = 1) as log_file_resp:
-
-        anim = animation.FuncAnimation(
-            fig,
-            run,
-            frames = new_data,
-            init_func = init_logs,
-            blit = False,
-            interval = 1000,
-            repeat = False
-        )
-    
-        resize_objects()
-        fig.canvas.mpl_connect('resize_event', resize_objects)
-        fig.canvas.mpl_connect('motion_notify_event', mouse_onmove)
-        
-        try:
-            pyplot.show()
-        except KeyboardInterrupt:
-            pass
-
-    soc.close()
-    return 0
-
-def onetime_action(user_dict):
-    args, address, port = [
-        user_dict[key] for key in ['args', 'address', 'port']
-    ]
-
-    if not args:
-        return 1
-    
-    command = args[0]
-    try:
-        value = args[1]
-    except IndexError:
-        value = ''
-                
-    return send_cmd(command, value, address, port = port)[0]
-    
-def send_cmd(cmd, value, address, soc = None,
-             port = socket_port, verbose = True):
-    
-    status, cmd_str = generate_cmd(cmd, value, address)
-    data = None
-    if status == 0:
-        if soc is None:
-            # one-time command mode
-            soc = connect_to_socket(port)
-            soc_close = True
-        else:
-            # continuous command mode
-            soc_close = False
-
-        # the device is to be halted (does not send a reply)
-        if 'format' not in device_commands[cmd]['read']:
-            # 1st byte is 0 => do not read reply from device
-            soc.sendall(bytes('0{}'.format(cmd_str), data_encoding))
-        else:
-            # read reply_length bytes from device
-            soc.sendall('2{length:0>2X}{cmd}'.format(
-                length = reply_length,
-                cmd = cmd_str
-            ).encode(data_encoding))
-            try:
-                reply = soc.recv(1024).decode(data_encoding)
-            except socket.timeout:
-                status = 2
-            else:
-                if len(reply) == reply_length:
-                    # data received is certainly valid
-                    data = reply[first_data_char - 1 : last_data_char]
-                else:
-                    # data received is partial, search for data field
-                    if value:
-                        cmd_type = 'write'
-                    else:
-                        cmd_type = 'read'
-    
-                    value_regex = device_commands[cmd][cmd_type]['format']
-                    value_regex = value_regex.replace('+', '[+-]')
-                    value_regex = value_regex.replace('D', '[0-9]')
-                    value_regex = value_regex.replace('A', '[a-zA-Z0-9_-]')
-                    regex_pat = regex.compile(value_regex)
-                    matches = regex_pat.findall(reply)
-                    if len(matches) == 1:
-                        data = matches[0]
-
-                if data is None:
-                    status = 2
-                    
-                elif verbose:
-                    print('Device replied with: {data}'.format(
-                        data = data))
-                    if 'info' in device_commands[cmd]['read']:
-                        print(device_commands[cmd]['read']['info'])
-                
-                    
-        if soc_close:
-            soc.close()
-
-    return status, data
-
-def connect_to_socket(port = socket_port):
-    soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        soc.connect((socket_host, port))
-    except ConnectionRefusedError:
-        print('Connection refused. Did you forget to start the daemon?',
-              file = sys.stderr)
-        sys.exit(2)
-        
-    soc.setblocking(0)
-    soc.settimeout(socket_timeout)
-    return soc
-
-###############################################################################
-################################ SERIAL RELATED ###############################
-###############################################################################
-
-def generate_fcs(cmd):
-    fcs = 0
-    for char in cmd:
-        fcs = fcs^ord(char)
-    return fcs
-
-def generate_cmd(cmd, value, address):
-    if cmd not in device_commands:
-        print('Invalid device command!', file = sys.stderr)
-        return 1, None
-        
-    if value:
-        cmd_type = 'write'
-    else:
-        cmd_type = 'read'
-        
-    cmd_code = device_commands[cmd]['code']
-    cmd_values = device_commands[cmd][cmd_type]
-    
-    # format must be defined if cmd_type is allowed for this command
-    if 'format' not in cmd_values:
-        print(('{type} is not a valid operation for command ' +
-               '{cmd}').format(cmd = cmd, type = cmd_type),
-              file = sys.stderr)
-        return 1, None
-
-    if cmd_type == 'write':
-        # it is a write command
-        cmd_type = write_char
-        if 'alias' in cmd_values:
-            for alias in cmd_values['alias']:
-                # check if it is an alias
-                if value.upper() == alias:
-                    value = cmd_values['alias'][alias]
-                    break
-            
-        else:
-            # else, first check if it is in the right format
-            value_regex = value_format = cmd_values['format']
-            value_regex = value_regex.replace('+', '[+-]')
-            value_regex = value_regex.replace('D', '[0-9]')
-            value_regex = value_regex.replace('A', '[a-zA-Z0-9_-]')
-            regex_pat = regex.compile(value_regex, regex.I)
-                
-            if value_format == '+DDD.DDD':
-                # value should be numeric
-                # accept any valid number and convert it to the right format
-                value = '{sign}{value:0>7.3f}'.format(
-                    sign = ('+' if value[0].isdigit() or \
-                            value[0] == '.' else value[0]),
-                    value = abs(float(value)))
-
-            if regex_pat.fullmatch(value) is None:
-                print(('{value} is neither a known alias nor in the ' +
-                       'allowed format for command {cmd}').format(
-                           cmd = cmd,
-                           value = value),
-                      file = sys.stderr)
-                return 1, None
-        
-            # then check if it is in the allowed range
-            if 'range' in cmd_values:
-                low_limit, high_limit = [
-                    float(el) for el in cmd_values['range'].split(' ')
-                ]
-                
-                if not low_limit <= float(value) <= high_limit:
-                    print(('{value} is not within the allowed numerical range ' +
-                           'for command {cmd}').format(cmd = cmd, value = value),
-                          file = sys.stderr)
-                    return 1, None
-
-    else:
-        # it is a read command
-        cmd_type = read_char
-        value = cmd_values['format'].replace('D', '0').replace('A', '0')
-
-    # command to the device must be in the following format
-    cmd = '{char}{unit_type}{unit_address}{cmd_type}{cmd_code}{value}'.format(
-        char = cmd_char,
-        unit_type = unit_type,
-        unit_address = address,
-        cmd_type = cmd_type,
-        cmd_code = cmd_code,
-        value = value
-    )
-    # append the FCS
-    cmd = '{cmd}{fcs:0>2X}'.format(cmd = cmd, fcs = generate_fcs(cmd))
-    return 0, cmd
-
-###############################################################################
-##################################### MISC ####################################
-###############################################################################
-
-def process_input(user_input, discard_action = False):
-    opts, args = opt_parser.parse_args(user_input)
-
-    # remove action, e.g. plot
-    action = None
-    if args[0] in allowed_actions:
-        action = args.pop(0)
-
-    if opts.port < 1:
-        print('Port number must be positive!', file = sys.stderr)
-        return 1, {}
-    
-    # is it a number? Serial defaults to /dev/ttyS? if so
-    if opts.device.isdigit():
-        opts.device = '/dev/ttyS{num}'.format(num = opts.device)
-    elif opts.device[0] != '/':
-        opts.device = '/dev/{tty}'.format(tty = opts.device)
-        
-    if not os.path.exists(opts.device):
-        print('No such file {tty}!'.format(tty = opts.device),
-              file = sys.stderr)
-        return 1, {}
-    
-    if not min_unit_address <= opts.address <= max_unit_address:
-        print(('Unit address must be between {min} and ' +
-               '{max}!').format(min = min_unit_address,
-                                   max = max_unit_address),
-              file = sys.stderr)
-        return 1, {}
-    opts.address = '{address!s:0>2}'.format(address = opts.address)
-
-    if opts.interval < 0:
-        print('Check interval cannot be negative!', file = sys.stderr)
-        return 1, {}
-
-    if opts.log_dir != '' \
-       and not os.path.isdir(opts.log_dir):
-            os.mkdir(opts.log_dir, mode = 0o755)
-
-    if opts.continue_log not in [None, 'last'] \
-       and not os.path.isfile(opts.continue_log):
-            print('No such file: {log}'.format(
-                log = opts.continue_log), file = sys.stderr)
-            return 1, {}
-            
-    if opts.temp_step <= 0:
-        print('Temperature step must be positive!', file = sys.stderr)
-        return 1, {}
-
-    if opts.stop_temp < opts.start_temp:
-        opts.temp_step = -opts.temp_step
-
-    if opts.samples <= 0:
-        print('Response samples must be positive!', file = sys.stderr)
-        return 1, {}
-
-    if opts.temp_error < 0:
-        print('Temperature error cannot be negative!', file = sys.stderr)
-        return 1, {}
-
-    if opts.timeout <= opts.interval * opts.samples:
-        print('Response timeout must be larger than samples * interval!', file = sys.stderr)
-        return 1, {}
-
-    user_dict = {}
-    for key in vars(opts):
-        user_dict[key] = getattr(opts, key)
-
-    user_dict['args'] = [ el.upper() for el in args ]
-    if action and not discard_action:
-        user_dict['args'].insert(0, action)
-
-    return 0, user_dict
-
-def usage():
-    process_input(['--help'])
-    
-###############################################################################
-#################################### GLOBAL ###################################
-###############################################################################
-
-allowed_actions = {
-    'start': {
-        'usage': '1* Daemon actions:\n    %prog start [--port] [--device]',
-        'callable': daemon_start
-    },
-    'stop': {
-        'usage': '2    %prog stop [--port]',
-        'callable': daemon_stop
-    },
-    'restart': {
-        'usage': '3    %prog restart [--port] [--device]',
-        'callable': daemon_restart
-    },
-    'status': {
-        'usage': '4  Print info about running instances:\n    %prog status',
-        'callable': daemon_status
-    },
-    'reload': {
-        'usage': '5  Reload configuration file:\n    %prog reload [--port]',
-        'callable': daemon_reload_config
-    },
-    'single': {
-        'usage': ('6* Send single command to device:\n' + \
-                  '    %prog <command> [<value>] [--port] [--address]'),
-        'callable': onetime_action
-    },
-    'interact': {
-        'usage': ('7* Read commands from stdin:\n' + \
-                  '    %prog interact [--address] [--port]'),
-        'callable': interact
-    },
-    'plot': {
-        'usage': ('8* Plot reply from first command vs time and log time ' + \
-                  '+ replies\n  for all given commands to file.\n' + \
-                  '  By default it plots ACT_T and logs TE_V and TE_I as ' + \
-                  'well:\n    %prog plot [<command> ...] [<options>]'),
-        'callable': plot_realtime
-    },
-    'response': {
-        'usage': ('9* Plot and log Tact vs Tset for the specified ' + \
-                  'range using the specified temperature step.\n' + \
-                  '  Also log all specified commands:\n' + \
-                  '  By default it logs time, TE_V and TE_I for all ' + \
-                  'points.\n  Irrespective of given commands it logs ' + \
-                  'average and sum of absolute deviation of T_ACT over ' + \
-                  'the\n  sample points, as well as stabilization time:\n' + \
-                  '    %prog response [<command> ...] [<options>]'),
-        'callable': response_curve
-    }
-}
-
-# required configuration of serial port
 serial_port = '/dev/ttyS0'
 baudrate = 19200
 bytesize = EIGHTBITS
@@ -1322,6 +331,994 @@ device_commands = {
     }
 }
 
+###############################################################################
+################################ DAEMON RELATED ###############################
+###############################################################################
+
+def get_pid(pidfile_path):
+    if not os.path.exists(pidfile_path):
+        return None
+    
+    with open(pidfile_path, 'r') as pidfile:
+        return int(pidfile.readline().strip())
+
+def get_pidfile(unit):
+    return pidfile.replace('<id>', unit)
+
+def get_socket(unit):
+    return ud_socket.replace('<id>', unit)
+
+def daemon_start(user_dict):
+    unit = user_dict['unit']
+    serial_port = user_dict['device']
+        
+    daemon = SerialDaemon(
+        name = exec_name,
+        config_file_path = config_file,
+        pidfile_path = get_pidfile(unit),
+        socket_path = get_socket(unit),
+        data_encoding = data_encoding,
+        reply_length_strict = discard_invalid,
+        port = serial_port,
+        baudrate = baudrate,
+        bytesize = bytesize,
+        parity = parity,
+        stopbits = stopbits,
+        xonxoff = xonxoff,
+        timeout = serial_timeout
+    )
+    daemon.start()
+    return 0
+    
+def daemon_stop(user_dict):
+    unit = user_dict['unit']
+    
+    pid = get_pid(get_pidfile(unit))
+    if pid is None:
+        return 1
+    
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        print('Could not kill process {}'.format(pid), file = sys.stderr)
+        return 1
+
+    return 0
+
+def daemon_restart(user_dict):
+    status = stop(user_dict)
+    if status != 0:
+        return status
+    
+    sleep(1)	# wait for pidfile lock
+    return start(user_dict)
+
+def daemon_status(user_dict):
+    instances = {}
+    pidbase = get_pidfile('')
+    for inst_pidfile in iglob(get_pidfile('*')):
+        pid = get_pid(inst_pidfile)
+        if pid is None:
+            # not running instance
+            continue
+        
+        # extract the unit address from the file name
+        inst_unit = ''
+        for char in ndiff(inst_pidfile, pidbase):
+            if char[0] != ' ':
+                inst_unit = inst_unit + char[-1]
+        instances[inst_unit] = pid
+        
+    if not instances:
+        print('No running instances.')
+        return 1
+        
+    for unit, pid in instances.items():
+        print('PID {pid!s} communicates with unit {unit}'.format(
+            pid = pid,
+            unit = unit))
+#        soc = connect_to_socket(unit)
+#        soc.sendall('device'.encode(data_encoding))
+#        try:
+#            device = soc.recv(1024).decode(data_encoding)
+#        except socket.timeout:
+#            print(('PID {pid!s} listening on socket {socket} ' + \
+#                   'is busy').format(
+#                       pid = pid,
+#                       socket = get_socket(inst_unit)))
+#        else:
+#            print(('PID {pid!s} listening on socket {socket} ' + \
+#                   'communicates with {dev}').format(
+#                       pid = pid,
+#                       socket = get_socket(inst_unit),
+#                       dev = device))
+    return 0
+    
+def daemon_reload_config(user_dict):
+    unit = user_dict['unit']
+    
+    pid = get_pidfile(unit)
+    if pid is None:
+        return 1
+    
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except OSError:
+        print('Could not send SIGHUP to process {}'.format(pid),
+              file = sys.stderr)
+        return 1
+    
+    return 0
+
+def interact(user_dict):
+    def prompt_msg():
+        print(('Communicating with unit {unit}.\nEnter "command ' + \
+               '[value] [--unit]".\nValues are optional, their ' + \
+               'presence indicates a write command.\nIf you have ' + \
+               'specified a unit on the\ninitial command line, ' + \
+               'it will take precedence over the default value.\n\n' + \
+               'Enter on blank line to quit.').format(unit = unit))
+
+    def error_msg():
+        print('Invalid syntax or device command!')
+
+    # unit specified on the command line takes precedence
+    unit = user_dict['unit']
+    
+    # save the default ones for restoration later
+    tmp_unit = unit_address
+    opt_parser.set_defaults(unit = unit)
+    
+    soc = connect_to_socket(unit)
+    try:
+        prompt_msg()
+        while True:
+            print('\n>', end = ' ')
+            try:
+                new_input = input()
+            except EOFError:
+                break
+            
+            if new_input == '':
+                break
+            status, user_dict = process_input(
+                new_input.split(' '))
+            
+            if status != 0:
+                error_msg()
+                continue
+                
+            args, unit = [
+                user_dict[key] for key in [
+                    'args',
+                    'unit'
+                ]
+            ]
+            
+            if not args:
+                break
+            
+            if get_socket(unit) != soc.getsockname():
+                soc.close()
+                soc = connect_to_socket(unit)
+                
+            command = args[0]
+            if command not in device_commands:
+                error_msg()
+                continue
+            
+            try:
+                value = args[1]
+            except IndexError:
+                value = ''
+                
+            send_cmd(command, value, unit, soc = soc)
+            
+    except KeyboardInterrupt:
+        pass
+
+    # restore original default values
+    opt_parser.set_defaults(unit = tmp_unit)
+
+    soc.close()
+    return 0
+
+def plot_realtime(user_dict):
+    return plot(user_dict)
+
+def response_curve(user_dict):
+    return plot(user_dict, response_curve = True)
+
+def plot(user_dict, response_curve = False):
+    
+    ################################### MISC ##################################
+    
+    # find the last modified log file for this unit
+    # this assumes the filename contains 'unit<id> and ends with .log'
+    def find_last_modified():
+        if log_dir:
+            root = '{root}/'.format(root = log_dir)
+        else:
+            root = ''
+
+        files = iglob('{root}*unit{unit}*.log'.format(
+            root = root,
+            unit = unit))
+
+        try:
+            last_file_path = max(files, key = os.path.getmtime)
+        except ValueError:
+            # no matching files
+            return None, []
+
+        with open(last_file_path, mode = 'r') as last_file:
+            headline = last_file.readline()[1:]
+
+        cmds = [cmd for cmd in headline.split()
+                if cmd not in ['time/s', 'SET_T']]
+
+        return last_file_path, cmds
+        
+    # read in time of last data point from the log we're appending to
+    def get_last_timestamp(log_path, time_field = 0):
+        with open(log_path, mode = 'rb') as log_file:
+            # jump to the second last byte and look backwards for newline
+            log_file.seek(-2, os.SEEK_END)
+            while log_file.read(1) != b'\n':
+                log_file.seek(-2, os.SEEK_CUR)
+            return float(log_file.readline().split()[time_field])
+            
+    
+    # find positions of items in the sorted array U item[i]
+    # ala numpy's searchsorted
+    # both arguments must support subscripting and all items must be numeric
+    def searchsorted(array, items):
+        try:
+            items[0]
+        except TypeError:
+            items  = [ items ]
+            
+        # default position is at the end of array
+        items_indices = [len(array)] * len(items)
+        for array_id, array_el in enumerate(array):
+            for item_id, item in enumerate(items):
+                if array_el >= item and items_indices[item_id] == len(array):
+                    # found a position inside array for item j
+                    items_indices[item_id] = array_id
+    
+        return items_indices
+    
+    ############################ BUTTON AND EVENTS ############################
+    
+    # mouse was moved
+    def mouse_onmove(event):
+        if event.xdata is None:
+            return
+        
+        coords_label.set_text('x = {x:.3f}, y = {y:.3f}'.format(
+            x = event.xdata,
+            y = event.ydata
+        ))
+    
+    # span selection completed
+    def span_onselect(xmin, xmax):
+        run.pause = False
+        imin, imax = searchsorted(xdata, (xmin, xmax))
+        imax = min(len(xdata) - 1, imax)
+        imin = min(len(xdata) - 1, imin)
+    
+        if imin == imax:
+            return
+        
+        ymin, ymax = axes.get_ylim()
+        ylim_padding_abs = ylim_padding * (ymax - ymin)
+        thisx = xdata[imin:imax]
+        thisy = ydata[imin:imax]
+        line_lower.set_data(thisx, thisy)
+        axes_lower.set_xlim(thisx[0], thisx[-1])
+        axes_lower.set_ylim(
+            min(thisy) - ylim_padding_abs,
+            max(thisy) + ylim_padding_abs
+        )
+    
+    # mouse was movied while span selection was active
+    def span_onmove(xmin, xmax):
+        run.pause = True
+    
+    # clear both graphs
+    def clear_graphs(event):
+        del xdata[:]
+        del ydata[:]
+        run.miny, run.maxy = None, None
+        line.set_data(xdata, ydata)
+        line_lower.set_data(xdata, ydata)
+        pyplot.draw()
+    
+    # save figure to file
+    def save_image(event):
+        axes_extent = axes.get_window_extent().transformed(
+            fig.dpi_scale_trans.inverted())
+        axes_lower_extent = axes_lower.get_window_extent().transformed(
+            fig.dpi_scale_trans.inverted())
+        fig_width, fig_height = fig.get_size_inches()
+        vpadding = 0.5    # in inches
+        fig.savefig(
+            '{cmd}_full_range_{time}.png'.format(
+                cmd = query_cmds[0],
+                time = strftime('%Y-%m-%d_%H-%M-%S')),
+            bbox_inches = Bbox.from_bounds(
+                0,
+                axes_extent.bounds[1] - vpadding,
+                fig_width,
+                axes_extent.bounds[3] + 2 * vpadding)) # include title
+        fig.savefig(
+            '{cmd}_zoomed_range_{time}.png'.format(
+                cmd = query_cmds[0],
+                time = strftime('%Y-%m-%d_%H-%M-%S')),
+            bbox_inches = Bbox.from_bounds(
+                0,
+                axes_lower_extent.bounds[1] - vpadding,
+                fig_width,
+                axes_lower_extent.bounds[3] + 1.2 * vpadding))
+    
+    # window was resized
+    def resize_objects(event = None):
+        # in pixels
+        toolbar_hpos = 20
+        toolbar_vpos = 10
+        button_width = 40
+        button_height = 25
+        button_padding = 20
+        coords_label_width = 150
+        
+        left_margin = 80
+        right_margin = 30
+        top_margin = 20
+        bottom_margin = 80
+        plot_padding = 140
+        fig_width, fig_height = fig.canvas.get_width_height()
+        
+        # convert to fractions
+        pyplot.subplots_adjust(
+            left = left_margin / fig_width,
+            bottom = bottom_margin / fig_height,
+            right = 1 - right_margin / fig_width,
+            top = 1 - top_margin / fig_height,
+            wspace = 0,
+            hspace = plot_padding / fig_height
+        )
+        button_clear.ax.set_position([
+            toolbar_hpos / fig_width,
+            toolbar_vpos / fig_height,
+            button_width / fig_width,
+            button_height / fig_height
+        ])
+        button_save.ax.set_position([
+            (toolbar_hpos + button_width + button_padding ) / fig_width,
+            toolbar_vpos / fig_height,
+            button_width / fig_width,
+            button_height / fig_height
+        ])
+        coords_label.axes.set_position([
+            1 - (coords_label_width + right_margin) / fig_width,
+            toolbar_vpos / fig_height,
+            coords_label_width / fig_width,
+            button_height / fig_height
+        ])
+    
+    ################################### DATA ##################################
+
+    # write headline to log files
+    def init_logs():
+        if log_to_old:
+            return
+        
+        if response_curve:
+            log_file.write('#time/s\tSET_T\t{data}\n'.format(
+                data = '\t'.join(query_cmds)))
+            log_file_resp.write('#time/s\tSET_T\tACT_T\tact_t_avg' + \
+                                '\tact_t_delta\tsample_time\n')
+        else:
+            log_file.write('#time/s\t{data}\n'.format(
+                data = '\t'.join(query_cmds)))
+
+    # get requested data
+    def get_data(query, known = []):
+        while True:
+            data = []
+            for cmd in query:
+                status, value = send_cmd(
+                    cmd,
+                    '',
+                    unit,
+                    soc = soc,
+                    verbose = False
+                )
+
+                if status == 2:
+                    # reading reply from device did not succeed, ignore
+                    data.append('null')
+                    continue
+
+                data.append(value)
+
+            if data[0] == 'null':
+                continue
+
+            known = ['{:.3f}'.format(el) for el in known]
+            log_file.write('{known}\t{data}\n'.format(
+                known = '\t'.join(known),
+                data = '\t'.join(data)))
+
+            return float(data[0])
+
+    # response curve data specifics, response_curve is True
+    def get_response():
+        set_temp = start_temp
+        if log_to_old:
+            start_time = time() - time_offset - interval
+        else:
+            start_time = time() - time_offset
+        
+        while (temp_step > 0 and set_temp <= stop_temp) \
+              or (temp_step < 0 and set_temp >= stop_temp):
+            send_cmd(
+                'SET_T',
+                '{temp!s}'.format(temp = set_temp),
+                unit,
+                soc = soc,
+                verbose = False
+            )
+            temp_history = []
+            
+            # wait until temperature stabilizes
+            meas_start_time = time()
+            
+            while True:
+                cur_time = time() - start_time
+                act_temp = get_data(
+                    query_cmds,
+                    known = [cur_time, set_temp]
+                )
+                if len(temp_history) >= samples:
+                    error = 0
+                    for prev_temp in temp_history:
+                        error += abs(act_temp - prev_temp)
+                        
+                    if error / samples <= max_error / 1000:
+                        break
+                        
+                    temp_history.pop(0)
+                        
+                temp_history.append(act_temp)
+                sleep(interval)
+                meas_time = time() - meas_start_time
+                if meas_time > timeout:
+                    break
+
+            log_file_resp.write(
+                ('{time:.3f}\t{set_t:.3f}\t{act_t:.3f}\t{act_t_avg:.3f}' + \
+                 '\t{act_t_delta:.3f}\t{sample_time:.3f}\n').format(
+                     time = cur_time,
+                     set_t = set_temp,
+                     act_t = act_temp,
+                     act_t_avg = mean(temp_history),
+                     act_t_delta = error,
+                     sample_time = meas_time
+                 )
+            )
+                
+            yield set_temp, act_temp
+            set_temp += temp_step / 1000
+                
+    # user requested data specifics, response_curve is False
+    def get_user_data():
+        if log_to_old:
+            start_time = time() - time_offset - interval
+        else:
+            start_time = time() - time_offset
+        
+        while True:
+            cur_time = time() - start_time
+            new_data = get_data(
+                query_cmds,
+                known = [cur_time]
+            )
+            yield cur_time, new_data
+            sleep(interval)
+
+    # plotting specifics
+    def run(data):
+        # update the data
+        x, y = data
+        if None in (run.maxy, run.miny):
+            run.miny = run.maxy = y
+            
+        xdata.append(x)
+        ydata.append(y)
+        if len(xdata) > max_data_points:
+            xdata.pop(0)
+            ypop = ydata.pop(0)
+            if ypop == run.maxy:
+                run.maxy = max(ydata)
+            elif ypop == run.miny:
+                run.miny = min(ydata)
+            
+        if not run.pause:
+            run.maxy = max(run.maxy, y)
+            run.miny = min(run.miny, y)
+            if xdata[0] == x:
+                axes_lower.set_xlim(x, x + 0.001)
+            else:
+                axes.set_xlim(xdata[0], x)
+            ymin, ymax = axes.get_ylim()
+            ylim_padding_abs = ylim_padding * (ymax - ymin)
+            axes.set_ylim(
+                run.miny - ylim_padding_abs,
+                run.maxy + ylim_padding_abs
+            )
+            line.set_data(xdata, ydata)
+    
+        return line,
+    
+    ################################### INIT ##################################
+
+    query_cmds, unit, interval, log_file_path, log_dir, no_log, \
+        continue_log, temp_step, start_temp, stop_temp, samples, max_error, \
+        timeout = [ user_dict[key] for key in [
+            'args', 'unit', 'interval', 'log_file', 'log_dir', 'no_log',
+            'continue_log', 'temp_step', 'start_temp', 'stop_temp',
+            'samples', 'temp_error', 'timeout' ] ]
+    
+    if not query_cmds:
+        query_cmds = ['ACT_T', 'TE_I', 'TE_V']
+    elif response_curve and 'ACT_T' not in query_cmds:
+        query_cmds.insert(0, 'ACT_T')
+        
+    # log files
+    time_offset = 0
+    log_to_old = False
+    if no_log:
+        log_file_path = os.devnull
+        del query_cmds[1:]		# no need to send additional commands
+        
+    elif continue_log is not None:
+        log_to_old = True
+        if continue_log == 'last':
+            log, cmds = find_last_modified()
+            if log and cmds:
+                continue_log = log
+                query_cmds = cmds
+            else:
+                log_to_old = False
+                
+        log_file_path = continue_log
+        time_offset = get_last_timestamp(continue_log)
+        
+    elif log_file_path is None:
+        log_file_path = os.path.join(log_dir,
+                                     '{cmd}_unit{unit}_{time}.log'.format(
+            cmd = query_cmds[0],
+            unit = unit,
+            time = strftime('%Y-%m-%d_%H-%M-%S')))
+        
+    if response_curve and not no_log:
+        log_resp_file_path = '_response.'.join(
+            log_file_path.rsplit('.', 1))
+    else:
+        log_resp_file_path = os.devnull
+
+    soc = connect_to_socket(unit)
+    
+    rcParams['toolbar'] = 'None'
+    
+    max_data_points = 500
+    ylim_padding = 0.1    # y-limit padding in fraction of range
+    xdata, ydata = [], []
+    fig = pyplot.figure()
+    axes = fig.add_subplot(211, axisbg = '#FFFFFF')       # full plot
+    axes_lower = fig.add_subplot(212, axisbg = '#FFFFFF') # zoom of user selection
+    line, = axes.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
+    line_lower, = axes_lower.plot(xdata, ydata, linestyle = '-', marker = '+', lw = 1)
+    nooff_formatter = ticker.ScalarFormatter(useOffset = False)
+    float_formatter = ticker.FormatStrFormatter('%.3f')
+    for ax in (axes, axes_lower):
+        ax.set_xlim(0, 1)
+        if response_curve:
+            ax.set_xlabel('SET_T / C')
+            ax.xaxis.set_major_formatter(float_formatter)
+        else:
+            ax.set_xlabel('Time / s')
+            ax.xaxis.set_major_formatter(nooff_formatter)
+        ax.set_ylabel(query_cmds[0])
+        ax.yaxis.set_major_formatter(float_formatter)
+        ax.grid()
+    run.pause = False	# pause plotting while spanning top plot
+    run.maxy = None
+    run.miny = None
+    coords_label = pyplot.text(
+        0,
+        0,
+        'x = {x:.3f}, y = {y:.3f}'.format(
+            x = 0,
+            y = 0
+        ),
+        transform = pyplot.axes([0, 0, 0, 0.2]).transAxes
+    )
+    coords_label.axes.set_axis_off()
+    
+    button_clear = Button(
+        pyplot.axes([0, 0, 0, 0]),
+        'Clear'
+    )
+    button_clear.on_clicked(clear_graphs)
+    button_save = Button(
+        pyplot.axes([0, 0, 0, 0.1]),
+        'Save'
+    )
+    button_save.on_clicked(save_image)
+    
+    span = SpanSelector(
+        axes,
+        span_onselect,
+        'horizontal',
+        onmove_callback = span_onmove,
+        rectprops = {
+            'alpha': 0.5,
+            'facecolor': 'red'
+        })
+    
+    if response_curve:
+        new_data =  get_response
+    else:
+        new_data = get_user_data
+
+    with open(log_file_path,
+              mode = 'a',
+              buffering = 1) as log_file, \
+        open(log_resp_file_path,
+             mode = 'a',
+             buffering = 1) as log_file_resp:
+
+        anim = animation.FuncAnimation(
+            fig,
+            run,
+            frames = new_data,
+            init_func = init_logs,
+            blit = False,
+            interval = 1000,
+            repeat = False
+        )
+    
+        resize_objects()
+        fig.canvas.mpl_connect('resize_event', resize_objects)
+        fig.canvas.mpl_connect('motion_notify_event', mouse_onmove)
+        
+        try:
+            pyplot.show()
+        except KeyboardInterrupt:
+            pass
+
+    soc.close()
+    return 0
+
+def onetime_action(user_dict):
+    args, unit = [
+        user_dict[key] for key in ['args', 'unit']
+    ]
+
+    if not args:
+        return 1
+    
+    command = args[0]
+    try:
+        value = args[1]
+    except IndexError:
+        value = ''
+                
+    return send_cmd(command, value, unit)[0]
+    
+def send_cmd(cmd, value, unit, soc = None, verbose = True):
+    
+    status, cmd_str = generate_cmd(cmd, value, unit)
+    data = None
+    if status == 0:
+        if soc is None:
+            # one-time command mode
+            soc = connect_to_socket(unit)
+            soc_close = True
+        else:
+            # continuous command mode
+            soc_close = False
+
+        # the device is to be halted (does not send a reply)
+        if 'format' not in device_commands[cmd]['read']:
+            # 1st byte is 0 => do not read reply from device
+            soc.sendall(bytes('0{}'.format(cmd_str), data_encoding))
+        else:
+            # read reply_length bytes from device
+            soc.sendall('2{length:0>2X}{cmd}'.format(
+                length = reply_length,
+                cmd = cmd_str
+            ).encode(data_encoding))
+            try:
+                reply = soc.recv(1024).decode(data_encoding)
+            except socket.timeout:
+                status = 2
+            else:
+                if len(reply) == reply_length:
+                    # data received is certainly valid
+                    data = reply[first_data_char - 1 : last_data_char]
+                else:
+                    # data received is partial, search for data field
+                    if value:
+                        cmd_type = 'write'
+                    else:
+                        cmd_type = 'read'
+    
+                    value_regex = device_commands[cmd][cmd_type]['format']
+                    value_regex = value_regex.replace('+', '[+-]')
+                    value_regex = value_regex.replace('D', '[0-9]')
+                    value_regex = value_regex.replace('A', '[a-zA-Z0-9_-]')
+                    regex_pat = regex.compile(value_regex)
+                    matches = regex_pat.findall(reply)
+                    if len(matches) == 1:
+                        data = matches[0]
+
+                if data is None:
+                    status = 2
+                    
+                elif verbose:
+                    print('Device replied with: {data}'.format(
+                        data = data))
+                    if 'info' in device_commands[cmd]['read']:
+                        print(device_commands[cmd]['read']['info'])
+                
+                    
+        if soc_close:
+            soc.close()
+
+    return status, data
+
+def connect_to_socket(unit = unit_address):
+    soc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        soc.connect(get_socket(unit))
+    except ConnectionRefusedError:
+        print('Connection refused. Did you forget to start the daemon?',
+              file = sys.stderr)
+        sys.exit(2)
+        
+    soc.setblocking(0)
+    soc.settimeout(socket_timeout)
+    return soc
+
+###############################################################################
+################################ SERIAL RELATED ###############################
+###############################################################################
+
+def generate_fcs(cmd):
+    fcs = 0
+    for char in cmd:
+        fcs = fcs^ord(char)
+    return fcs
+
+def generate_cmd(cmd, value, unit):
+    if cmd not in device_commands:
+        print('Invalid device command!', file = sys.stderr)
+        return 1, None
+        
+    if value:
+        cmd_type = 'write'
+    else:
+        cmd_type = 'read'
+        
+    cmd_code = device_commands[cmd]['code']
+    cmd_values = device_commands[cmd][cmd_type]
+    
+    # format must be defined if cmd_type is allowed for this command
+    if 'format' not in cmd_values:
+        print(('{type} is not a valid operation for command ' +
+               '{cmd}').format(cmd = cmd, type = cmd_type),
+              file = sys.stderr)
+        return 1, None
+
+    if cmd_type == 'write':
+        # it is a write command
+        cmd_type = write_char
+        if 'alias' in cmd_values:
+            for alias in cmd_values['alias']:
+                # check if it is an alias
+                if value.upper() == alias:
+                    value = cmd_values['alias'][alias]
+                    break
+            
+        else:
+            # else, first check if it is in the right format
+            value_regex = value_format = cmd_values['format']
+            value_regex = value_regex.replace('+', '[+-]')
+            value_regex = value_regex.replace('D', '[0-9]')
+            value_regex = value_regex.replace('A', '[a-zA-Z0-9_-]')
+            regex_pat = regex.compile(value_regex, regex.I)
+                
+            if value_format == '+DDD.DDD':
+                # value should be numeric
+                # accept any valid number and convert it to the right format
+                value = '{sign}{value:0>7.3f}'.format(
+                    sign = ('+' if value[0].isdigit() or \
+                            value[0] == '.' else value[0]),
+                    value = abs(float(value)))
+
+            if regex_pat.fullmatch(value) is None:
+                print(('{value} is neither a known alias nor in the ' +
+                       'allowed format for command {cmd}').format(
+                           cmd = cmd,
+                           value = value),
+                      file = sys.stderr)
+                return 1, None
+        
+            # then check if it is in the allowed range
+            if 'range' in cmd_values:
+                low_limit, high_limit = [
+                    float(el) for el in cmd_values['range'].split(' ')
+                ]
+                
+                if not low_limit <= float(value) <= high_limit:
+                    print(('{value} is not within the allowed numerical range ' +
+                           'for command {cmd}').format(cmd = cmd, value = value),
+                          file = sys.stderr)
+                    return 1, None
+
+    else:
+        # it is a read command
+        cmd_type = read_char
+        value = cmd_values['format'].replace('D', '0').replace('A', '0')
+
+    # command to the device must be in the following format
+    cmd = '{char}{unit_type}{unit_address}{cmd_type}{cmd_code}{value}'.format(
+        char = cmd_char,
+        unit_type = unit_type,
+        unit_address = unit,
+        cmd_type = cmd_type,
+        cmd_code = cmd_code,
+        value = value
+    )
+    # append the FCS
+    cmd = '{cmd}{fcs:0>2X}'.format(cmd = cmd, fcs = generate_fcs(cmd))
+    return 0, cmd
+
+###############################################################################
+##################################### MISC ####################################
+###############################################################################
+
+def process_input(user_input, discard_action = False):
+    opts, args = opt_parser.parse_args(user_input)
+
+    # remove action, e.g. plot
+    action = None
+    if args[0] in allowed_actions:
+        action = args.pop(0)
+
+    # is it a number? Serial defaults to /dev/ttyS? if so
+    if opts.device.isdigit():
+        opts.device = '/dev/ttyS{num}'.format(num = opts.device)
+    elif opts.device[0] != '/':
+        opts.device = '/dev/{tty}'.format(tty = opts.device)
+        
+    if not os.path.exists(opts.device):
+        print('No such file {tty}!'.format(tty = opts.device),
+              file = sys.stderr)
+        return 1, {}
+    
+    if not min_unit_address <= opts.unit <= max_unit_address:
+        print(('Unit address must be between {min} and ' +
+               '{max}!').format(min = min_unit_address,
+                                   max = max_unit_address),
+              file = sys.stderr)
+        return 1, {}
+    opts.unit = '{unit!s:0>2}'.format(unit = opts.unit)
+
+    if opts.interval < 0:
+        print('Check interval cannot be negative!', file = sys.stderr)
+        return 1, {}
+
+    if opts.log_dir != '' \
+       and not os.path.isdir(opts.log_dir):
+            os.mkdir(opts.log_dir, mode = 0o755)
+
+    if opts.continue_log not in [None, 'last'] \
+       and not os.path.isfile(opts.continue_log):
+            print('No such file: {log}'.format(
+                log = opts.continue_log), file = sys.stderr)
+            return 1, {}
+            
+    if opts.temp_step <= 0:
+        print('Temperature step must be positive!', file = sys.stderr)
+        return 1, {}
+
+    if opts.stop_temp < opts.start_temp:
+        opts.temp_step = -opts.temp_step
+
+    if opts.samples <= 0:
+        print('Response samples must be positive!', file = sys.stderr)
+        return 1, {}
+
+    if opts.temp_error < 0:
+        print('Temperature error cannot be negative!', file = sys.stderr)
+        return 1, {}
+
+    if opts.timeout <= opts.interval * opts.samples:
+        print('Response timeout must be larger than samples * interval!', file = sys.stderr)
+        return 1, {}
+
+    user_dict = {}
+    for key in vars(opts):
+        user_dict[key] = getattr(opts, key)
+
+    user_dict['args'] = [ el.upper() for el in args ]
+    if action and not discard_action:
+        user_dict['args'].insert(0, action)
+
+    return 0, user_dict
+
+def usage():
+    process_input(['--help'])
+    
+###############################################################################
+##################################### MAIN ####################################
+###############################################################################
+
+allowed_actions = {
+    'start': {
+        'usage': '1* Daemon actions:\n    %prog start [--unit] [--device]',
+        'callable': daemon_start
+    },
+    'stop': {
+        'usage': '2    %prog stop [--unit]',
+        'callable': daemon_stop
+    },
+    'restart': {
+        'usage': '3    %prog restart [--unit] [--device]',
+        'callable': daemon_restart
+    },
+    'status': {
+        'usage': '4  Print info about running instances:\n    %prog status',
+        'callable': daemon_status
+    },
+    'reload': {
+        'usage': '5  Reload configuration file:\n    %prog reload [--unit]',
+        'callable': daemon_reload_config
+    },
+    'single': {
+        'usage': ('6* Send single command to device:\n' + \
+                  '    %prog <command> [<value>] [--unit]'),
+        'callable': onetime_action
+    },
+    'interact': {
+        'usage': ('7* Read commands from stdin:\n' + \
+                  '    %prog interact [--unit]'),
+        'callable': interact
+    },
+    'plot': {
+        'usage': ('8* Plot reply from first command vs time and log time ' + \
+                  '+ replies\n  for all given commands to file.\n' + \
+                  '  By default it plots ACT_T and logs TE_V and TE_I as ' + \
+                  'well:\n    %prog plot [<command> ...] [<options>]'),
+        'callable': plot_realtime
+    },
+    'response': {
+        'usage': ('9* Plot and log Tact vs Tset for the specified ' + \
+                  'range using the specified temperature step.\n' + \
+                  '  Also log all specified commands:\n' + \
+                  '  By default it logs time, TE_V and TE_I for all ' + \
+                  'points.\n  Irrespective of given commands it logs ' + \
+                  'average and sum of absolute deviation of T_ACT over ' + \
+                  'the\n  sample points, as well as stabilization time:\n' + \
+                  '    %prog response [<command> ...] [<options>]'),
+        'callable': response_curve
+    }
+}
+
 usage_msg = ('\n{actions}\n\n' + \
              'Available commands (case-insensitive):\n{cmds}').format(
                  actions = '\n'.join(
@@ -1332,15 +1329,6 @@ usage_msg = ('\n{actions}\n\n' + \
 opt_parser = OptionParser(
     usage = usage_msg,
     option_list = [
-        make_option('-p', '--port',
-                    type = 'int',
-                    dest = 'port',
-                    help = ('port number the daemon is listening on; ' + \
-                            'default is {default}.').format(
-                                default = socket_port),
-                    metavar = 'PORT',
-                    default = socket_port
-        ),
         make_option('-D', '--device',
                     type = 'string',
                     dest = 'device',
@@ -1350,9 +1338,9 @@ opt_parser = OptionParser(
                     metavar = 'DEV',
                     default = serial_port
         ),
-        make_option('-a', '--address',
+        make_option('-u', '--unit',
                     type = 'int',
-                    dest = 'address',
+                    dest = 'unit',
                     help = ('address of unit: {min} to {max}; ' + \
                             'default is {default}.').format(
                                 min = min_unit_address,
@@ -1467,10 +1455,6 @@ opt_parser = OptionParser(
         )
     ]
 )
-
-###############################################################################
-##################################### MAIN ####################################
-###############################################################################
 
 if os.geteuid() != 0:
     print('Error: Must run as root', file = sys.stderr)

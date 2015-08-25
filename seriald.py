@@ -83,11 +83,10 @@ class SerialDaemon():
         :Default: ``'/etc/<name>.conf'``
 
         Configuration file used to set some of the hereby listed parameters.
-        Currently, only pidfile_path, socket_port, socket_host, data_length
-        and data_encoding are supported. Reloading of the configuration without
-        restarting is done by sending SIGHUP to the daemon but please note that
-        changes to pidfile_path, socket_port or socket_host require restart to
-        take effect.
+        All but name, daemon_context and serial_context are supported.
+        Reloading of the configuration without restarting is done by sending
+        SIGHUP to the daemon but please note that changes to pidfile_path,
+        socket_path and log_file require restart to take effect.
         The format is as follows:
             <option_name> = <option value>
         Option names are case-INsensitive and ``_`` may be replaced by ``-``.
@@ -109,20 +108,12 @@ class SerialDaemon():
         initialization but before start. Changing either of them after the
         daemon is started requires a restart.
 
-    socket_port
-        :Default: ``57001``
+    socket_path
+        :Default: ``'/var/run/<name>.socket'``
 
-        Port which the daemon will be listening on. See above for details on
-        the data format. Changing this after the daemon is started requires a
-        restart. Also see documentation for serial.py.
-
-    socket_host
-        :Default: ``''``
-
-        Interface which the daemon will be listening on. Empty string signifies
-        all interfaces. See above for details on the data format. Changing this
-        after the daemon is started requires a restart. Also see documentation
-        for serial.py.
+        Path for the unix daemon socket which the daemon will be listening on.
+        Changing this after the daemon is started requires a restart. Also see
+        documentation for serial.py.
 
     data_length
         :Default: ``1024``
@@ -169,10 +160,9 @@ class SerialDaemon():
             config_file = 0,
             log_file = None,
             pidfile_path = 0,
-            socket_port = 57001,
-            socket_host = '',		# all available interfaces
-            data_length = 1024,
+            socket_path = 0,
             reply_length_strict = False,
+            data_length = 1024,
             data_encoding = 'utf-8',
             daemon_context = None,
             serial_context = None,
@@ -195,10 +185,12 @@ class SerialDaemon():
         if self.pidfile_path == 0:
             self.pidfile_path = '/var/run/{name}.pid'.format(name = self.name)
 
-        self.socket_port = socket_port
-        self.socket_host = socket_host
-        self.data_length = data_length
+        self.socket_path = socket_path
+        if self.socket_path == 0:
+            self.socket_path = '/var/run/{name}.socket'.format(name = self.name)
+            
         self.reply_length_strict = reply_length_strict
+        self.data_length = data_length
         self.data_encoding = data_encoding
         
         self.daemon_context = daemon_context
@@ -228,11 +220,7 @@ class SerialDaemon():
 
         with open(self.log_file, 'a') as log_file:
             try:
-                logsyslog(LOG_INFO, 'Waiting for connection')
-                soc, soc_addr = self.socket.accept()
-                logsyslog(LOG_INFO, 'Connected to {addr}'.format(
-                    addr = soc_addr))
-                
+                soc = None
                 # flush doesn't work in daemon mode for ttyS?
                 # close and reopen instead
                 device = self.serial_context.port
@@ -253,7 +241,7 @@ class SerialDaemon():
                     device = '/dev/ttyS{num}'.format(num = device)
                                 
                 while True:
-                    if soc.fileno() < 0:
+                    if not soc or soc.fileno() < 0:
                         logsyslog(LOG_INFO, 'Waiting for connection')
                         soc, soc_addr = self.socket.accept()
                         logsyslog(LOG_INFO, ('Connected to {addr}').format(
@@ -325,19 +313,26 @@ class SerialDaemon():
         self.__stop()
                 
     def __load_config(self):
-        if self.config_file is not None:
-            conf = _openfile(self.config_file, 'r')
-            
+        def reset_invalid_value(opt):
+            logsyslog(LOG_ERR,
+                      ('{conf}: Invalid value for ' +
+                       '{option}').format(
+                           conf = self.config_file,
+                           option = opt))
+            return getattr(self, opt)
+
+        conf = _openfile(self.config_file, 'r')
         if conf is not None:
-            
             with conf:
+            
                 regex_pat = regex.compile(r"""\s* (?|
                     (?P<option>
+                      reply_length_strict |
                       data[-_]length |
                       data[-_]encoding |
-		      socket[-_]port |
-		      socket[-_]host |
-                      pidfile[-_]path
+                      log[-_]file |
+                      pidfile[-_]path |
+		      socket[-_]path
 		    ) \s* (?: =\s* )?
 		    (?|
                       " (?P<value> [^"]+ ) " |
@@ -357,23 +352,26 @@ class SerialDaemon():
                     if match:
                         # translate the option name to the object's attribute
                         opt = match.group('option').lower().replace('-', '_')
-
+                        
                         if opt.endswith(('file',
                                          'dir',
                                          'path',
-                                         'host',
                                          'encoding')):
+                            # value is a string
                             val = match.group('value')
+                        elif opt == 'reply_length_strict':
+                            # value must be a boolean
+                            if val.lower() not in ['0', '1', 'false', 'true']:
+                                val = reset_invalid_value(opt)
+                            elif val.lower() in ['0', 'false']:
+                                val = False
+                            else:
+                                val = True
                         else:
                             # value must be numeric and positive
                             val = int(match.group('value'))
                             if val <= 0:
-                                logsyslog(LOG_ERR,
-                                          ('{conf}: Invalid value for ' +
-                                           '{option}').format(
-                                               conf = self.config_file,
-                                               option = opt))
-                                val = getattr(self, opt)
+                                val = reset_invalid_value(opt)
                                 
                         setattr(self, opt, val)
                         
@@ -383,25 +381,29 @@ class SerialDaemon():
                                                 conf = self.config_file,
                                                 line = line_num))
                         
-            logsyslog(LOG_INFO, '{conf} loaded'.format(
+            logsyslog(LOG_INFO, 'Loaded configuration from {conf}'.format(
                 conf = self.config_file))
 
     def start(self):
         """
-        Load config, daemonize, connect to serial port, listen on socket port
+        Load config, daemonize, connect to serial port, listen on socket
         """
         opensyslog(ident = self.name, facility = LOG_DAEMON)
         
         self.__load_config()
         if self.pidfile_path is not None:
             self.daemon_context.pidfile = lockfile.FileLock(self.pidfile_path)
+            
+        if _pidfile_isbusy(self.daemon_context.pidfile):
+            logsyslog(LOG_ERR, 'Already running (pidfile is locked)')
+            closesyslog()
+            return
         
-        if os.path.exists(self.daemon_context.pidfile.path):
-            if _pidfile_isbusy(self.daemon_context.pidfile):
-                logsyslog(LOG_ERR, 'Already running (pidfile is locked)')
-                closesyslog()
-                return
-
+        if _socket_isbusy(self.socket_path):
+            logsyslog(LOG_ERR, 'Already running (socket is in use)')
+            closesyslog()
+            return
+        
         self.daemon_context.open()
         with _openfile(self.daemon_context.pidfile.path, 'w',
                       fail = self.__stop) as file:
@@ -411,11 +413,11 @@ class SerialDaemon():
         # self.serial_context.open()
         logsyslog(LOG_INFO, 'Started')
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.socket.bind((self.socket_host, self.socket_port))
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.bind(self.socket_path)
         self.socket.listen(1)
-        logsyslog(LOG_INFO, ('Listening on port {port}').format(
-            port = self.socket_port))
+        logsyslog(LOG_INFO, ('Listening on socket {socket}').format(
+            socket = self.socket_path))
         self.__run()
         
     def __stop(self):
@@ -424,11 +426,15 @@ class SerialDaemon():
             return
 
         logsyslog(LOG_INFO, 'Stopping')
+        
+        os.remove(self.socket.getsockname())
+        os.remove(self.daemon_context.pidfile.path)
+        
         self.socket.close()
+        
         if self.serial_context.isOpen():
             self.serial_context.close()
         self.daemon_context.close()
-        os.remove(self.daemon_context.pidfile.path)
         
         try:
             os.kill(pid, signal.SIGKILL)
@@ -468,12 +474,15 @@ def _openfile(path, mode = 'r', fail = None):
     if fail is not None:
         fail()
         sys.exit(255)
+
+    return None
         
 def _get_pid(pidfile_path):
     pidfile = _openfile(pidfile_path, 'r')
     if pidfile is not None:
         with pidfile:
             return int(pidfile.readline().strip())
+        
     return None
 
 def _pidfile_isbusy(pidlock):
@@ -490,3 +499,9 @@ def _pidfile_isbusy(pidlock):
         return False
     else:
         return True
+
+def _socket_isbusy(socket_path):
+    if os.path.exists(socket_path):
+        return True
+
+    return False
