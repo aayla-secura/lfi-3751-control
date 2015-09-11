@@ -433,7 +433,7 @@ def daemon_status(user_dict):
         print('No running instances.')
         return 1
         
-    for unit, pid in instances.items():
+    for unit, pid in sorted(instances.items()):
         soc = connect_to_socket(unit)
         soc.sendall('device'.encode(data_encoding))
         try:
@@ -1219,19 +1219,59 @@ def generate_cmd(command, value, unit):
 ##################################### MISC ####################################
 ###############################################################################
 
+def set_unit_number(user_dict):
+    unit = None
+    try:
+        unit = int(user_dict['unit'])
+    except ValueError:
+        # it's an alias
+        unit = user_dict['unit']
+        try:
+            unit = int(unit_aliases[unit])
+        except KeyError:
+            print('Unit alias "{alias}" not defined!'.format(
+                alias = unit), file = sys.stderr)
+            return 1
+        except ValueError:
+            print('Unit addresses must be integers!', file = sys.stderr)
+            return 1
+        
+    user_dict['unit'] = '{unit!s:0>2}'.format(unit = unit)
+    return 0
+            
+def set_device_fd(user_dict):
+    device = None
+    try:
+        device = user_dict['device']
+    except KeyError:
+        # it's not explicitly given, try aliases
+        try:
+            device = device_aliases[user_dict['unit']]
+        except KeyError:
+            # either alias not defined, or unit not defined
+            device = serial_port
+            
+    # is it a number? Serial defaults to /dev/ttyS? if so        
+    if device.isdigit():
+        device = '/dev/ttyS{num}'.format(num = device)
+    elif device[0] != '/':
+        device = '/dev/{tty}'.format(tty = device)
+
+    user_dict['device'] = device
+
 def load_config(config_file):
     
     def set_alias(rule, db):
         regex_pat = regex.compile(r"""\s*
-            (?<unit> [0-9]+ ) \s* :
-            \s* (?P<value> .* )
+            (?<alias> [^:]+? ) \s* :
+            \s* (?P<value> .+ )
             """, regex.X|regex.I)
         
         match = regex_pat.match(rule)
         if match:
-            unit = '{unit!s:0>2}'.format(unit = match.group('unit'))
-            val = match.group('value')
-            db[unit] = val
+            alias = '{unit!s:0>2}'.format(unit = match.group('alias'))
+            val = '{unit!s:0>2}'.format(unit = match.group('value'))
+            db[alias] = val
         return
     
     if not os.path.exists(config_file):
@@ -1394,8 +1434,8 @@ def process_input(user_input, use_defaults = True):
                     usage()
 
     try:
-        args.unit
-    except AttributeError:
+        args.unit = int(args.unit)
+    except (AttributeError, ValueError):
         pass
     else:
         if not min_unit_address <= args.unit <= max_unit_address:
@@ -1404,23 +1444,12 @@ def process_input(user_input, use_defaults = True):
                                     max = max_unit_address),
                   file = sys.stderr)
             return 1, {}
-        args.unit = '{unit!s:0>2}'.format(unit = args.unit)
         
     try:
         args.device
     except AttributeError:
-        # device was not set explicitly, check alias db, otherwise use default
-        try:
-            args.device = device_aliases[args.unit]
-        except (KeyError, AttributeError):
-            # either alias not defined, or unit not defined
-            args.device = serial_port
-    # is it a number? Serial defaults to /dev/ttyS? if so        
-    if args.device.isdigit():
-        args.device = '/dev/ttyS{num}'.format(num = args.device)
-    elif args.device[0] != '/':
-        args.device = '/dev/{tty}'.format(tty = args.device)
-
+        pass
+    
     try:
         if args.interval < 0:
             print('Check interval cannot be negative!', file = sys.stderr)
@@ -1597,7 +1626,7 @@ arg_parser.add_argument('-D', '--device',
                         metavar = 'DEV'
                     )
 arg_parser.add_argument('-u', '--unit',
-                        type = int,
+                        type = str,
                         dest = 'unit',
                         help = ('address of unit: {min} to {max} ' + \
                                 '(default: {default!s})').format(
@@ -1733,5 +1762,11 @@ if status != 0:
 # command line options override config file
 for opt, val in user_dict.items():
     conf_dict[opt] = val
+
+status = set_unit_number(conf_dict)
+if status != 0:
+    sys.exit(status)
+
+set_device_fd(conf_dict)
 
 sys.exit(allowed_actions[action](conf_dict))
