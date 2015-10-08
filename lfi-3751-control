@@ -768,7 +768,8 @@ def plot(action, user_dict):
             start_time = time() - time_offset - interval
         else:
             start_time = time() - time_offset
-        
+
+        cur_time = 0
         while (temp_step > 0 and set_temp <= stop_temp) \
               or (temp_step < 0 and set_temp >= stop_temp):
             status = send_cmd(
@@ -790,9 +791,8 @@ def plot(action, user_dict):
             
             # wait until temperature stabilizes
             meas_start_time = time()
-            
+
             while True:
-                cur_time = time() - start_time
                 act_temp = get_data(
                     query_cmds,
                     known = [cur_time, set_temp]
@@ -800,8 +800,8 @@ def plot(action, user_dict):
                 if act_temp is None:
                     return
                 
+                error = 0
                 if len(temp_history) >= samples:
-                    error = 0
                     for prev_temp in temp_history:
                         error += abs(act_temp - prev_temp)
                         
@@ -811,7 +811,14 @@ def plot(action, user_dict):
                     temp_history.pop(0)
                         
                 temp_history.append(act_temp)
-                sleep(interval)
+
+                try:
+                    delay = time() - start_time - cur_time
+                    sleep(interval - delay)
+                except ValueError:
+                    pass
+
+                cur_time += interval
                 meas_time = time() - meas_start_time
                 if meas_time > timeout:
                     break
@@ -1499,12 +1506,12 @@ def process_input(user_input, use_defaults = True):
     except AttributeError:
         pass
 
-    try:
-        if args.timeout <= args.interval * args.samples:
-            print('Response timeout must be larger than samples * interval!', file = sys.stderr)
-            return 1, {}
-    except AttributeError:
-        pass
+#    try:
+#        if args.timeout <= args.interval * args.samples:
+#            print('Response timeout must be larger than samples * interval!', file = sys.stderr)
+#            return 1, {}
+#    except AttributeError:
+#        pass
 
     user_dict = {}
     for key in vars(args):
